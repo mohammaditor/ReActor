@@ -178,9 +178,12 @@ def _try_decode_base64_image(value: str) -> Image.Image | None:
 
 
 def _load_image(path_or_url: str, cache_subdir: Path) -> Image.Image:
+    cache_subdir.mkdir(parents=True, exist_ok=True)
+    cache_key = _sha256_hex(path_or_url)
+
     decoded_inline_image = _try_decode_base64_image(path_or_url)
     if decoded_inline_image is not None:
-        cache_file = cache_subdir / f"{_sha256_hex(path_or_url)}.png"
+        cache_file = cache_subdir / f"{cache_key}.png"
         if cache_file.exists():
             return Image.open(cache_file).convert("RGB")
         decoded_inline_image.save(cache_file, format="PNG")
@@ -194,7 +197,7 @@ def _load_image(path_or_url: str, cache_subdir: Path) -> Image.Image:
     # So for HTTP(S), keep the URL as-is and do not unquote it again.
     if _is_url(path_or_url):
         ext = Path(urlparse(path_or_url).path).suffix or ".img"
-        cache_file = cache_subdir / f"{_sha256_hex(path_or_url)}{ext}"
+        cache_file = cache_subdir / f"{cache_key}{ext}"
         if not cache_file.exists():
             req = Request(path_or_url, headers={"User-Agent": "ReActor-Standalone/1.0"})
             with urlopen(req, timeout=60) as response:
@@ -208,7 +211,12 @@ def _load_image(path_or_url: str, cache_subdir: Path) -> Image.Image:
         img_path = Path.cwd() / img_path
     if not img_path.exists():
         raise FileNotFoundError(f"Image not found: {img_path}")
-    return Image.open(img_path).convert("RGB")
+    cache_file = cache_subdir / f"{cache_key}.png"
+    if cache_file.exists():
+        return Image.open(cache_file).convert("RGB")
+    local_img = Image.open(img_path).convert("RGB")
+    local_img.save(cache_file, format="PNG")
+    return local_img
 
 
 def _pick_swap_model() -> str:
