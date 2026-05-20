@@ -29,7 +29,10 @@ def _install_comfy_stubs() -> None:
     folder_paths.add_model_folder_path = add_model_folder_path
 
     comfy = types.ModuleType("comfy")
+    comfy.__path__ = []  # mark as package for submodule imports
+
     model_management = types.ModuleType("comfy.model_management")
+    utils = types.ModuleType("comfy.utils")
 
     def processing_interrupted() -> bool:
         return False
@@ -37,12 +40,35 @@ def _install_comfy_stubs() -> None:
     def get_torch_device() -> str:
         return "cuda" if os.environ.get("CUDA_VISIBLE_DEVICES") else "cpu"
 
+    class ProgressBar:
+        def __init__(self, total: int):
+            self.total = max(int(total), 0)
+            self.current = 0
+
+        def update_absolute(self, value: int, total: int | None = None):
+            if total is not None:
+                self.total = max(int(total), 0)
+            self.current = max(int(value), 0)
+
+        def update(self, step: int = 1):
+            self.current += int(step)
+
+    def load_torch_file(path: str, safe_load: bool = True):
+        import torch
+        return torch.load(path, map_location="cpu")
+
     model_management.processing_interrupted = processing_interrupted
     model_management.get_torch_device = get_torch_device
+    utils.ProgressBar = ProgressBar
+    utils.load_torch_file = load_torch_file
+
+    comfy.model_management = model_management
+    comfy.utils = utils
 
     sys.modules["folder_paths"] = folder_paths
     sys.modules["comfy"] = comfy
     sys.modules["comfy.model_management"] = model_management
+    sys.modules["comfy.utils"] = utils
 
 
 _install_comfy_stubs()
