@@ -315,6 +315,13 @@ class SwapHandler(BaseHTTPRequestHandler):
         elapsed_ms = (time.perf_counter() - start) * 1000
         print(f"[swap] outcome={outcome} elapsed_ms={elapsed_ms:.2f} path={self.path}")
 
+    def _send_jpeg(self, body: bytes) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", "image/jpeg")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
 
 def main() -> None:
     host = os.environ.get("REACTOR_HOST", "0.0.0.0")
