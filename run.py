@@ -3,6 +3,7 @@ import io
 import os
 import sys
 import threading
+import time
 import types
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
@@ -245,9 +246,11 @@ class SwapHandler(BaseHTTPRequestHandler):
     model_path = _pick_swap_model()
 
     def do_GET(self):
+        request_start = time.perf_counter()
         parsed = urlparse(self.path)
         if parsed.path != "/swap":
             self.send_error(404, "Use /swap")
+            self._log_request_timing(request_start, "invalid_path")
             return
 
         params = parse_qs(parsed.query)
@@ -255,6 +258,7 @@ class SwapHandler(BaseHTTPRequestHandler):
         target_url = params.get("target_url", [None])[0]
         if not source_url or not target_url:
             self.send_error(400, "source_url and target_url are required")
+            self._log_request_timing(request_start, "missing_required_params")
             return
 
         try:
@@ -268,6 +272,7 @@ class SwapHandler(BaseHTTPRequestHandler):
                 if result_path.exists():
                     body = result_path.read_bytes()
                     self._send_jpeg(body)
+                    self._log_request_timing(request_start, "cache_hit")
                     return
 
             def _run_swap() -> bytes:
@@ -289,6 +294,7 @@ class SwapHandler(BaseHTTPRequestHandler):
 
             body = SWAP_EXECUTOR.submit(_run_swap).result()
             self._send_jpeg(body)
+            self._log_request_timing(request_start, "processed")
         except Exception as exc:
             error = str(exc).encode("utf-8", errors="ignore")
             self.send_response(500)
@@ -296,6 +302,18 @@ class SwapHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(error)))
             self.end_headers()
             self.wfile.write(error)
+            self._log_request_timing(request_start, "error")
+
+    def _send_jpeg(self, body: bytes) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", "image/jpeg")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _log_request_timing(self, start: float, outcome: str) -> None:
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        print(f"[swap] outcome={outcome} elapsed_ms={elapsed_ms:.2f} path={self.path}")
 
     def _send_jpeg(self, body: bytes) -> None:
         self.send_response(200)
