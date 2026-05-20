@@ -271,6 +271,17 @@ def _build_swap_options(params: dict[str, list[str]]) -> dict:
 class SwapHandler(BaseHTTPRequestHandler):
     model_path = _pick_swap_model()
 
+    def end_headers(self) -> None:
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "*")
+        super().end_headers()
+
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
     def do_GET(self):
         request_start = time.perf_counter()
         parsed = urlparse(self.path)
@@ -340,13 +351,6 @@ class SwapHandler(BaseHTTPRequestHandler):
     def _log_request_timing(self, start: float, outcome: str) -> None:
         elapsed_ms = (time.perf_counter() - start) * 1000
         print(f"[swap] outcome={outcome} elapsed_ms={elapsed_ms:.2f} path={self.path}")
-
-    def _send_jpeg(self, body: bytes) -> None:
-        self.send_response(200)
-        self.send_header("Content-Type", "image/jpeg")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
 
 
 def main() -> None:
