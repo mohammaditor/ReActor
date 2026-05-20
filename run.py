@@ -63,6 +63,11 @@ def _sha256_hex(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+def _image_sha256_hex(image: Image.Image) -> str:
+    normalized = image.convert("RGB")
+    return hashlib.sha256(normalized.tobytes()).hexdigest()
+
+
 def _install_comfy_stubs() -> None:
     """Install minimal stubs so ReActor can run outside ComfyUI."""
     models_dir = str(MODELS_DIR.resolve())
@@ -150,7 +155,33 @@ def _is_url(value: str) -> bool:
     return value.startswith("http://") or value.startswith("https://")
 
 
+def _try_decode_base64_image(value: str) -> Image.Image | None:
+    candidate = value.strip()
+    marker_idx = candidate.find("base64,")
+    if marker_idx == -1:
+        return None
+
+    import base64
+    import io
+
+    payload = candidate[marker_idx + len("base64,") :]
+    normalized_payload = "".join(payload.split())
+    try:
+        decoded = base64.b64decode(normalized_payload)
+    except Exception:
+        return None
+
+    try:
+        return Image.open(io.BytesIO(decoded)).convert("RGB")
+    except Exception:
+        return None
+
+
 def _load_image(path_or_url: str, cache_subdir: Path) -> Image.Image:
+    decoded_inline_image = _try_decode_base64_image(path_or_url)
+    if decoded_inline_image is not None:
+        return decoded_inline_image
+
     # IMPORTANT:
     # - query parsing already decodes URL parameters once.
     # - some CDNs include encoded characters inside path segments (e.g. %20).
@@ -245,6 +276,17 @@ def _build_swap_options(params: dict[str, list[str]]) -> dict:
 class SwapHandler(BaseHTTPRequestHandler):
     model_path = _pick_swap_model()
 
+    def end_headers(self) -> None:
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "*")
+        super().end_headers()
+
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
     def do_GET(self):
         request_start = time.perf_counter()
         parsed = urlparse(self.path)
@@ -263,21 +305,18 @@ class SwapHandler(BaseHTTPRequestHandler):
 
         try:
             swap_options = _build_swap_options(params)
+            source_bucket_dir = SOURCES_CACHE_DIR / _sha256_hex(source_url)
+            source_bucket_dir.mkdir(parents=True, exist_ok=True)
+            source_img = _load_image(source_url, source_bucket_dir)
+            target_img = _load_image(target_url, TARGETS_CACHE_DIR)
+            source_hash = _image_sha256_hex(source_img)
+            target_hash = _image_sha256_hex(target_img)
             cache_key = _sha256_hex(
-                f"source={source_url}|target={target_url}|opts={repr(sorted(swap_options.items()))}|model={self.model_path}"
+                f"source={source_hash}|target={target_hash}|opts={repr(sorted(swap_options.items()))}|model={self.model_path}"
             )
             result_path = RESULTS_CACHE_DIR / f"{cache_key}.jpg"
 
-            with RESULT_LOCK:
-                if result_path.exists():
-                    body = result_path.read_bytes()
-                    self._send_jpeg(body)
-                    self._log_request_timing(request_start, "cache_hit")
-                    return
-
             def _run_swap() -> bytes:
-                source_img = _load_image(source_url, SOURCES_CACHE_DIR)
-                target_img = _load_image(target_url, TARGETS_CACHE_DIR)
                 swapped_img, _, _ = swap_face(
                     source_img=source_img,
                     target_img=target_img,
@@ -291,6 +330,13 @@ class SwapHandler(BaseHTTPRequestHandler):
                     if not result_path.exists():
                         result_path.write_bytes(body_inner)
                 return body_inner
+
+            with RESULT_LOCK:
+                if result_path.exists():
+                    body = result_path.read_bytes()
+                    self._send_jpeg(body)
+                    self._log_request_timing(request_start, "cache_hit")
+                    return
 
             body = SWAP_EXECUTOR.submit(_run_swap).result()
             self._send_jpeg(body)
@@ -314,13 +360,6 @@ class SwapHandler(BaseHTTPRequestHandler):
     def _log_request_timing(self, start: float, outcome: str) -> None:
         elapsed_ms = (time.perf_counter() - start) * 1000
         print(f"[swap] outcome={outcome} elapsed_ms={elapsed_ms:.2f} path={self.path}")
-
-    def _send_jpeg(self, body: bytes) -> None:
-        self.send_response(200)
-        self.send_header("Content-Type", "image/jpeg")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
 
 
 def main() -> None:
