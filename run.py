@@ -19,7 +19,7 @@ REPO_MODELS_DIR = REPO_ROOT / "models"
 # reactor_swapper has legacy migration logic that treats ./models as an old path
 # and may try to move/remove it on startup.
 # Use another directory, e.g. r"D:/Ai/AiTest/ReActorModels".
-MODELS_DIR = Path(r"D:/Ai/AiTest/ReActorModels")
+MODELS_DIR = Path(r"D:/Ai/AiTest/ReActor/models")
 
 # Optional: set a direct model file path (.onnx/.pth). If None, auto-discovery is used.
 SWAP_MODEL_PATH = None
