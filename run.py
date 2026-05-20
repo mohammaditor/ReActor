@@ -63,6 +63,11 @@ def _sha256_hex(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+def _image_sha256_hex(image: Image.Image) -> str:
+    normalized = image.convert("RGB")
+    return hashlib.sha256(normalized.tobytes()).hexdigest()
+
+
 def _install_comfy_stubs() -> None:
     """Install minimal stubs so ReActor can run outside ComfyUI."""
     models_dir = str(MODELS_DIR.resolve())
@@ -300,21 +305,18 @@ class SwapHandler(BaseHTTPRequestHandler):
 
         try:
             swap_options = _build_swap_options(params)
+            source_bucket_dir = SOURCES_CACHE_DIR / _sha256_hex(source_url)
+            source_bucket_dir.mkdir(parents=True, exist_ok=True)
+            source_img = _load_image(source_url, source_bucket_dir)
+            target_img = _load_image(target_url, TARGETS_CACHE_DIR)
+            source_hash = _image_sha256_hex(source_img)
+            target_hash = _image_sha256_hex(target_img)
             cache_key = _sha256_hex(
-                f"source={source_url}|target={target_url}|opts={repr(sorted(swap_options.items()))}|model={self.model_path}"
+                f"source={source_hash}|target={target_hash}|opts={repr(sorted(swap_options.items()))}|model={self.model_path}"
             )
             result_path = RESULTS_CACHE_DIR / f"{cache_key}.jpg"
 
-            with RESULT_LOCK:
-                if result_path.exists():
-                    body = result_path.read_bytes()
-                    self._send_jpeg(body)
-                    self._log_request_timing(request_start, "cache_hit")
-                    return
-
             def _run_swap() -> bytes:
-                source_img = _load_image(source_url, SOURCES_CACHE_DIR)
-                target_img = _load_image(target_url, TARGETS_CACHE_DIR)
                 swapped_img, _, _ = swap_face(
                     source_img=source_img,
                     target_img=target_img,
@@ -328,6 +330,13 @@ class SwapHandler(BaseHTTPRequestHandler):
                     if not result_path.exists():
                         result_path.write_bytes(body_inner)
                 return body_inner
+
+            with RESULT_LOCK:
+                if result_path.exists():
+                    body = result_path.read_bytes()
+                    self._send_jpeg(body)
+                    self._log_request_timing(request_start, "cache_hit")
+                    return
 
             body = SWAP_EXECUTOR.submit(_run_swap).result()
             self._send_jpeg(body)
