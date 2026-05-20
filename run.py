@@ -180,6 +180,10 @@ def _try_decode_base64_image(value: str) -> Image.Image | None:
 def _load_image(path_or_url: str, cache_subdir: Path) -> Image.Image:
     decoded_inline_image = _try_decode_base64_image(path_or_url)
     if decoded_inline_image is not None:
+        cache_file = cache_subdir / f"{_sha256_hex(path_or_url)}.png"
+        if cache_file.exists():
+            return Image.open(cache_file).convert("RGB")
+        decoded_inline_image.save(cache_file, format="PNG")
         return decoded_inline_image
 
     # IMPORTANT:
@@ -305,16 +309,16 @@ class SwapHandler(BaseHTTPRequestHandler):
 
         try:
             swap_options = _build_swap_options(params)
-            source_bucket_dir = SOURCES_CACHE_DIR / _sha256_hex(source_url)
-            source_bucket_dir.mkdir(parents=True, exist_ok=True)
-            source_img = _load_image(source_url, source_bucket_dir)
+            source_img = _load_image(source_url, SOURCES_CACHE_DIR)
             target_img = _load_image(target_url, TARGETS_CACHE_DIR)
             source_hash = _image_sha256_hex(source_img)
             target_hash = _image_sha256_hex(target_img)
+            source_result_dir = RESULTS_CACHE_DIR / source_hash
+            source_result_dir.mkdir(parents=True, exist_ok=True)
             cache_key = _sha256_hex(
                 f"source={source_hash}|target={target_hash}|opts={repr(sorted(swap_options.items()))}|model={self.model_path}"
             )
-            result_path = RESULTS_CACHE_DIR / f"{cache_key}.jpg"
+            result_path = source_result_dir / f"{cache_key}.jpg"
 
             def _run_swap() -> bytes:
                 swapped_img, _, _ = swap_face(
