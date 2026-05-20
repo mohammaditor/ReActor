@@ -1,11 +1,14 @@
+import hashlib
 import io
 import os
 import sys
+import threading
 import types
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse, unquote
-from urllib.request import urlopen, Request
+from urllib.parse import parse_qs, unquote, urlparse
+from urllib.request import Request, urlopen
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from concurrent.futures import ThreadPoolExecutor
 
 from PIL import Image
 
@@ -23,12 +26,44 @@ MODELS_DIR = Path(r"D:/Ai/AiTest/ReActor/_models")
 
 # Optional: set a direct model file path (.onnx/.pth). If None, auto-discovery is used.
 SWAP_MODEL_PATH = None
+
+# Device mode for Comfy stub: "cpu" or "gpu".
+# - "gpu": forces torch device to "cuda".
+# - "cpu": forces torch device to "cpu".
+# - You can also set REACTOR_DEVICE env var to override at runtime.
+DEVICE_MODE = "gpu"
+
+# Concurrency limit for simultaneous /swap processing.
+# Even if 20+ requests arrive together, only this many are processed concurrently.
+MAX_CONCURRENT_REQUESTS = 4
+
+# Cache root folder for both downloaded inputs and processed outputs.
+# Structure:
+# - CACHE_DIR/sources/<hash_of_source_url_or_path>.img
+# - CACHE_DIR/targets/<hash_of_target_url_or_path>.img
+# - CACHE_DIR/results/<hash_of_source+target+params>.jpg
+CACHE_DIR = REPO_ROOT / "cache"
+SOURCES_CACHE_DIR = CACHE_DIR / "sources"
+TARGETS_CACHE_DIR = CACHE_DIR / "targets"
+RESULTS_CACHE_DIR = CACHE_DIR / "results"
 # ===============================================================
+
+SWAP_EXECUTOR = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_REQUESTS)
+RESULT_LOCK = threading.Lock()
+
+
+def _ensure_cache_dirs() -> None:
+    SOURCES_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    TARGETS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    RESULTS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _sha256_hex(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
 def _install_comfy_stubs() -> None:
     """Install minimal stubs so ReActor can run outside ComfyUI."""
-    repo_root = Path(__file__).resolve().parent
     models_dir = str(MODELS_DIR.resolve())
 
     folder_paths = types.ModuleType("folder_paths")
@@ -45,7 +80,7 @@ def _install_comfy_stubs() -> None:
     folder_paths.add_model_folder_path = add_model_folder_path
 
     comfy = types.ModuleType("comfy")
-    comfy.__path__ = []  # mark as package for submodule imports
+    comfy.__path__ = []
 
     model_management = types.ModuleType("comfy.model_management")
     utils = types.ModuleType("comfy.utils")
@@ -54,7 +89,10 @@ def _install_comfy_stubs() -> None:
         return False
 
     def get_torch_device() -> str:
-        return "cuda" if os.environ.get("CUDA_VISIBLE_DEVICES") else "cpu"
+        requested = os.environ.get("REACTOR_DEVICE", DEVICE_MODE).lower()
+        if requested == "gpu":
+            return "cuda"
+        return "cpu"
 
     class ProgressBar:
         def __init__(self, total: int):
@@ -71,6 +109,7 @@ def _install_comfy_stubs() -> None:
 
     def load_torch_file(path: str, safe_load: bool = True):
         import torch
+
         return torch.load(path, map_location="cpu")
 
     model_management.processing_interrupted = processing_interrupted
@@ -100,8 +139,7 @@ def _validate_model_paths() -> None:
 
 
 _validate_model_paths()
-
-
+_ensure_cache_dirs()
 _install_comfy_stubs()
 
 from scripts.reactor_swapper import swap_face  # noqa: E402
@@ -111,13 +149,17 @@ def _is_url(value: str) -> bool:
     return value.startswith("http://") or value.startswith("https://")
 
 
-def _load_image(path_or_url: str) -> Image.Image:
+def _load_image(path_or_url: str, cache_subdir: Path) -> Image.Image:
     val = unquote(path_or_url)
     if _is_url(val):
-        req = Request(val, headers={"User-Agent": "ReActor-Standalone/1.0"})
-        with urlopen(req, timeout=60) as response:
-            data = response.read()
-        return Image.open(io.BytesIO(data)).convert("RGB")
+        ext = Path(urlparse(val).path).suffix or ".img"
+        cache_file = cache_subdir / f"{_sha256_hex(val)}{ext}"
+        if not cache_file.exists():
+            req = Request(val, headers={"User-Agent": "ReActor-Standalone/1.0"})
+            with urlopen(req, timeout=60) as response:
+                data = response.read()
+            cache_file.write_bytes(data)
+        return Image.open(cache_file).convert("RGB")
 
     img_path = Path(val)
     if not img_path.is_absolute():
@@ -152,6 +194,47 @@ def _pick_swap_model() -> str:
     return str(candidates[0])
 
 
+def _build_swap_options(params: dict[str, list[str]]) -> dict:
+    """Map URL query parameters to swap_face options.
+
+    Examples:
+    - source_faces_index=0,1
+    - faces_index=0
+    - gender_source=0
+    - gender_target=0
+    - faces_order=large-small,large-small
+    - face_boost_enabled=true
+    """
+
+    def _bool(name: str, default: bool) -> bool:
+        raw = params.get(name, [str(default)])[0].strip().lower()
+        return raw in {"1", "true", "yes", "on"}
+
+    def _int(name: str, default: int) -> int:
+        return int(params.get(name, [str(default)])[0])
+
+    def _int_list(name: str, default: list[int]) -> list[int]:
+        raw = params.get(name, [None])[0]
+        if raw is None or raw.strip() == "":
+            return default
+        return [int(x.strip()) for x in raw.split(",") if x.strip() != ""]
+
+    def _str_list(name: str, default: list[str]) -> list[str]:
+        raw = params.get(name, [None])[0]
+        if raw is None or raw.strip() == "":
+            return default
+        return [x.strip() for x in raw.split(",") if x.strip() != ""]
+
+    return {
+        "source_faces_index": _int_list("source_faces_index", [0]),
+        "faces_index": _int_list("faces_index", [0]),
+        "gender_source": _int("gender_source", 0),
+        "gender_target": _int("gender_target", 0),
+        "faces_order": _str_list("faces_order", ["large-small", "large-small"]),
+        "face_boost_enabled": _bool("face_boost_enabled", False),
+    }
+
+
 class SwapHandler(BaseHTTPRequestHandler):
     model_path = _pick_swap_model()
 
@@ -169,29 +252,37 @@ class SwapHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            source_img = _load_image(source_url)
-            target_img = _load_image(target_url)
-            swapped_img, _, _ = swap_face(
-                source_img=source_img,
-                target_img=target_img,
-                model=self.model_path,
-                source_faces_index=[0],
-                faces_index=[0],
-                gender_source=0,
-                gender_target=0,
-                faces_order=["large-small", "large-small"],
-                face_boost_enabled=False,
+            swap_options = _build_swap_options(params)
+            cache_key = _sha256_hex(
+                f"source={source_url}|target={target_url}|opts={repr(sorted(swap_options.items()))}|model={self.model_path}"
             )
+            result_path = RESULTS_CACHE_DIR / f"{cache_key}.jpg"
 
-            output = io.BytesIO()
-            swapped_img.save(output, format="JPEG", quality=95)
-            body = output.getvalue()
+            with RESULT_LOCK:
+                if result_path.exists():
+                    body = result_path.read_bytes()
+                    self._send_jpeg(body)
+                    return
 
-            self.send_response(200)
-            self.send_header("Content-Type", "image/jpeg")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+            def _run_swap() -> bytes:
+                source_img = _load_image(source_url, SOURCES_CACHE_DIR)
+                target_img = _load_image(target_url, TARGETS_CACHE_DIR)
+                swapped_img, _, _ = swap_face(
+                    source_img=source_img,
+                    target_img=target_img,
+                    model=self.model_path,
+                    **swap_options,
+                )
+                output = io.BytesIO()
+                swapped_img.save(output, format="JPEG", quality=95)
+                body_inner = output.getvalue()
+                with RESULT_LOCK:
+                    if not result_path.exists():
+                        result_path.write_bytes(body_inner)
+                return body_inner
+
+            body = SWAP_EXECUTOR.submit(_run_swap).result()
+            self._send_jpeg(body)
         except Exception as exc:
             error = str(exc).encode("utf-8", errors="ignore")
             self.send_response(500)
@@ -199,6 +290,13 @@ class SwapHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(error)))
             self.end_headers()
             self.wfile.write(error)
+
+    def _send_jpeg(self, body: bytes) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", "image/jpeg")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
 
 def main() -> None:
@@ -208,7 +306,11 @@ def main() -> None:
     print(f"ReActor standalone API is running on http://{host}:{port}")
     print(f"Models dir: {MODELS_DIR}")
     print(f"Model file: {SwapHandler.model_path}")
+    print(f"Device mode: {os.environ.get('REACTOR_DEVICE', DEVICE_MODE)}")
+    print(f"Max concurrent requests: {MAX_CONCURRENT_REQUESTS}")
+    print(f"Cache dir: {CACHE_DIR}")
     print("Example: /swap?source_url=./source.jpg&target_url=https%3A%2F%2Fexample.com%2Ftarget.jpg")
+    print("Example with params: &source_faces_index=0,1&faces_index=0&face_boost_enabled=true")
     server.serve_forever()
 
 
