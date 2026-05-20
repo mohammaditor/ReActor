@@ -10,10 +10,26 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from PIL import Image
 
 
+# ===== Standalone configuration (edit these paths directly) =====
+REPO_ROOT = Path(__file__).resolve().parent
+REPO_MODELS_DIR = REPO_ROOT / "models"
+
+# IMPORTANT:
+# Do NOT point MODELS_DIR to REPO_MODELS_DIR (./models).
+# reactor_swapper has legacy migration logic that treats ./models as an old path
+# and may try to move/remove it on startup.
+# Use another directory, e.g. r"D:/Ai/AiTest/ReActorModels".
+MODELS_DIR = Path(r"D:/Ai/AiTest/ReActorModels")
+
+# Optional: set a direct model file path (.onnx/.pth). If None, auto-discovery is used.
+SWAP_MODEL_PATH = None
+# ===============================================================
+
+
 def _install_comfy_stubs() -> None:
     """Install minimal stubs so ReActor can run outside ComfyUI."""
     repo_root = Path(__file__).resolve().parent
-    models_dir = os.environ.get("REACTOR_MODELS_DIR", str(repo_root / "models"))
+    models_dir = str(MODELS_DIR.resolve())
 
     folder_paths = types.ModuleType("folder_paths")
     folder_paths.models_dir = models_dir
@@ -71,6 +87,21 @@ def _install_comfy_stubs() -> None:
     sys.modules["comfy.utils"] = utils
 
 
+
+def _validate_model_paths() -> None:
+    models_dir_resolved = MODELS_DIR.resolve()
+    repo_models_resolved = REPO_MODELS_DIR.resolve()
+    if models_dir_resolved == repo_models_resolved:
+        raise RuntimeError(
+            "Invalid MODELS_DIR: it points to './models' inside this repo. "
+            "Set MODELS_DIR in run.py to another folder path (outside repo/models) "
+            "to avoid legacy cleanup side effects in reactor_swapper."
+        )
+
+
+_validate_model_paths()
+
+
 _install_comfy_stubs()
 
 from scripts.reactor_swapper import swap_face  # noqa: E402
@@ -97,7 +128,15 @@ def _load_image(path_or_url: str) -> Image.Image:
 
 
 def _pick_swap_model() -> str:
-    models_root = Path(os.environ.get("REACTOR_MODELS_DIR", Path(__file__).resolve().parent / "models"))
+    if SWAP_MODEL_PATH is not None:
+        model_path = Path(SWAP_MODEL_PATH)
+        if not model_path.is_absolute():
+            model_path = (Path(__file__).resolve().parent / model_path).resolve()
+        if not model_path.exists():
+            raise FileNotFoundError(f"Configured SWAP_MODEL_PATH does not exist: {model_path}")
+        return str(model_path)
+
+    models_root = Path(MODELS_DIR)
     candidates = []
     for subdir in ("hyperswap", "reswapper", "insightface"):
         root = models_root / subdir
@@ -167,6 +206,8 @@ def main() -> None:
     port = int(os.environ.get("REACTOR_PORT", "8004"))
     server = ThreadingHTTPServer((host, port), SwapHandler)
     print(f"ReActor standalone API is running on http://{host}:{port}")
+    print(f"Models dir: {MODELS_DIR}")
+    print(f"Model file: {SwapHandler.model_path}")
     print("Example: /swap?source_url=./source.jpg&target_url=https%3A%2F%2Fexample.com%2Ftarget.jpg")
     server.serve_forever()
 
