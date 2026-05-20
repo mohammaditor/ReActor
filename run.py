@@ -150,7 +150,33 @@ def _is_url(value: str) -> bool:
     return value.startswith("http://") or value.startswith("https://")
 
 
+def _try_decode_base64_image(value: str) -> Image.Image | None:
+    candidate = value.strip()
+    marker_idx = candidate.find("base64,")
+    if marker_idx == -1:
+        return None
+
+    import base64
+    import io
+
+    payload = candidate[marker_idx + len("base64,") :]
+    normalized_payload = "".join(payload.split())
+    try:
+        decoded = base64.b64decode(normalized_payload)
+    except Exception:
+        return None
+
+    try:
+        return Image.open(io.BytesIO(decoded)).convert("RGB")
+    except Exception:
+        return None
+
+
 def _load_image(path_or_url: str, cache_subdir: Path) -> Image.Image:
+    decoded_inline_image = _try_decode_base64_image(path_or_url)
+    if decoded_inline_image is not None:
+        return decoded_inline_image
+
     # IMPORTANT:
     # - query parsing already decodes URL parameters once.
     # - some CDNs include encoded characters inside path segments (e.g. %20).
