@@ -150,17 +150,23 @@ def _is_url(value: str) -> bool:
 
 
 def _load_image(path_or_url: str, cache_subdir: Path) -> Image.Image:
-    val = unquote(path_or_url)
-    if _is_url(val):
-        ext = Path(urlparse(val).path).suffix or ".img"
-        cache_file = cache_subdir / f"{_sha256_hex(val)}{ext}"
+    # IMPORTANT:
+    # - query parsing already decodes URL parameters once.
+    # - some CDNs include encoded characters inside path segments (e.g. %20).
+    # If we unquote() a remote URL again, %20 turns into a literal space and
+    # urllib raises "URL can't contain control characters".
+    # So for HTTP(S), keep the URL as-is and do not unquote it again.
+    if _is_url(path_or_url):
+        ext = Path(urlparse(path_or_url).path).suffix or ".img"
+        cache_file = cache_subdir / f"{_sha256_hex(path_or_url)}{ext}"
         if not cache_file.exists():
-            req = Request(val, headers={"User-Agent": "ReActor-Standalone/1.0"})
+            req = Request(path_or_url, headers={"User-Agent": "ReActor-Standalone/1.0"})
             with urlopen(req, timeout=60) as response:
                 data = response.read()
             cache_file.write_bytes(data)
         return Image.open(cache_file).convert("RGB")
 
+    val = unquote(path_or_url)
     img_path = Path(val)
     if not img_path.is_absolute():
         img_path = Path.cwd() / img_path
