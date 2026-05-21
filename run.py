@@ -178,12 +178,20 @@ def _try_decode_base64_image(value: str) -> Image.Image | None:
 
 
 def _load_image(path_or_url: str, cache_subdir: Path) -> Image.Image:
+    """
+    Load the *current* image for a source/target reference.
+
+    Cache policy:
+    - Never trust URL/path identity as image identity.
+    - Always resolve fresh bytes first, then cache by content hash.
+    - This guarantees we only reuse cache when source/target content is truly unchanged.
+    """
     cache_subdir.mkdir(parents=True, exist_ok=True)
-    cache_key = _sha256_hex(path_or_url)
 
     decoded_inline_image = _try_decode_base64_image(path_or_url)
     if decoded_inline_image is not None:
-        cache_file = cache_subdir / f"{cache_key}.png"
+        content_hash = _image_sha256_hex(decoded_inline_image)
+        cache_file = cache_subdir / f"{content_hash}.png"
         if cache_file.exists():
             return Image.open(cache_file).convert("RGB")
         decoded_inline_image.save(cache_file, format="PNG")
@@ -196,14 +204,16 @@ def _load_image(path_or_url: str, cache_subdir: Path) -> Image.Image:
     # urllib raises "URL can't contain control characters".
     # So for HTTP(S), keep the URL as-is and do not unquote it again.
     if _is_url(path_or_url):
-        ext = Path(urlparse(path_or_url).path).suffix or ".img"
-        cache_file = cache_subdir / f"{cache_key}{ext}"
+        req = Request(path_or_url, headers={"User-Agent": "ReActor-Standalone/1.0"})
+        with urlopen(req, timeout=60) as response:
+            data = response.read()
+
+        image = Image.open(io.BytesIO(data)).convert("RGB")
+        content_hash = _image_sha256_hex(image)
+        cache_file = cache_subdir / f"{content_hash}.png"
         if not cache_file.exists():
-            req = Request(path_or_url, headers={"User-Agent": "ReActor-Standalone/1.0"})
-            with urlopen(req, timeout=60) as response:
-                data = response.read()
-            cache_file.write_bytes(data)
-        return Image.open(cache_file).convert("RGB")
+            image.save(cache_file, format="PNG")
+        return image
 
     val = unquote(path_or_url)
     img_path = Path(val)
@@ -211,10 +221,12 @@ def _load_image(path_or_url: str, cache_subdir: Path) -> Image.Image:
         img_path = Path.cwd() / img_path
     if not img_path.exists():
         raise FileNotFoundError(f"Image not found: {img_path}")
-    cache_file = cache_subdir / f"{cache_key}.png"
+
+    local_img = Image.open(img_path).convert("RGB")
+    content_hash = _image_sha256_hex(local_img)
+    cache_file = cache_subdir / f"{content_hash}.png"
     if cache_file.exists():
         return Image.open(cache_file).convert("RGB")
-    local_img = Image.open(img_path).convert("RGB")
     local_img.save(cache_file, format="PNG")
     return local_img
 
