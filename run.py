@@ -4,6 +4,7 @@ import os
 import sys
 import threading
 import time
+import uuid
 import types
 import ssl
 from pathlib import Path
@@ -384,6 +385,12 @@ class SwapHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         request_start = time.perf_counter()
+        request_id = uuid.uuid4().hex[:8]
+        stage_times_ms: dict[str, float] = {}
+
+        def mark(stage_name: str, stage_start: float) -> None:
+            stage_times_ms[stage_name] = (time.perf_counter() - stage_start) * 1000
+
         parsed = urlparse(self.path)
         if parsed.path not in {"/swap", "/swap_face_square"}:
             self.send_error(404, "Use /swap or /swap_face_square")
@@ -400,9 +407,19 @@ class SwapHandler(BaseHTTPRequestHandler):
             return
 
         try:
+            t_stage = time.perf_counter()
             swap_options = _build_swap_options(params)
+            mark("parse_options", t_stage)
+
+            t_stage = time.perf_counter()
             source_img, _ = _load_image(source_url, SOURCES_CACHE_DIR)
+            mark("load_source", t_stage)
+
+            t_stage = time.perf_counter()
             target_img, target_cache_file = _load_image(target_url, TARGETS_CACHE_DIR)
+            mark("load_target", t_stage)
+
+            t_stage = time.perf_counter()
             source_hash = _image_sha256_hex(source_img)
             target_hash = _image_sha256_hex(target_img)
             target_face_cache_file = _face_cache_path_for_target(target_cache_file)
@@ -413,11 +430,17 @@ class SwapHandler(BaseHTTPRequestHandler):
                 f"source={source_hash}|target={target_hash}|opts={repr(sorted(swap_options.items()))}|model={self.model_path}|mode={'square' if only_face_square else 'full'}"
             )
             result_path = source_result_dir / f"{cache_key}.jpg"
+            mark("prepare_cache_key", t_stage)
 
             def _run_swap() -> tuple[bytes, tuple[int, int, int, int] | None]:
                 runtime_target_image = target_img
                 used_face_cache = False
                 cached_face_position = None
+                run_swap_stage_times_ms: dict[str, float] = {}
+
+                def run_swap_mark(stage_name: str, stage_start: float) -> None:
+                    run_swap_stage_times_ms[stage_name] = (time.perf_counter() - stage_start) * 1000
+
                 if only_face_square and target_face_cache_file.exists():
                     # IMPORTANT:
                     # When sidecar face cache exists, /swap_face_square must run ONLY on that file.
@@ -425,12 +448,15 @@ class SwapHandler(BaseHTTPRequestHandler):
                     runtime_target_image = Image.open(target_face_cache_file).convert("RGB")
                     used_face_cache = True
                     cached_face_position = _read_face_position(target_face_position_file)
+                    run_swap_stage_times_ms["face_square_cache_hit"] = 1.0
                 elif only_face_square:
+                    t_detect = time.perf_counter()
                     import cv2
                     import numpy as np
 
                     target_bgr = cv2.cvtColor(np.array(target_img), cv2.COLOR_RGB2BGR)
                     faces = analyze_faces(target_bgr)
+                    run_swap_mark("detect_target_face", t_detect)
                     if len(faces) == 0:
                         raise RuntimeError("No target face found to crop")
 
@@ -442,18 +468,22 @@ class SwapHandler(BaseHTTPRequestHandler):
                     runtime_target_image = target_img.crop(crop_box)
                     cached_face_position = crop_box
                     used_face_cache = True
+                    t_save_face_cache = time.perf_counter()
                     with RESULT_LOCK:
                         if not target_face_cache_file.exists():
                             runtime_target_image.save(target_face_cache_file, format="PNG")
                         if not target_face_position_file.exists():
                             _write_face_position(target_face_position_file, crop_box)
+                    run_swap_mark("save_face_square_cache", t_save_face_cache)
 
+                t_swap = time.perf_counter()
                 swapped_img, bboxes, _ = swap_face(
                     source_img=source_img,
                     target_img=runtime_target_image,
                     model=self.model_path,
                     **swap_options,
                 )
+                run_swap_mark("swap", t_swap)
 
                 crop_box = None
                 output_image = swapped_img
@@ -473,28 +503,40 @@ class SwapHandler(BaseHTTPRequestHandler):
                                 _write_face_position(target_face_position_file, crop_box)
 
                 output = io.BytesIO()
+                t_encode = time.perf_counter()
                 output_image.save(output, format="JPEG", quality=95)
                 body_inner = output.getvalue()
+                run_swap_mark("encode_jpeg", t_encode)
+
+                t_write_result_cache = time.perf_counter()
                 with RESULT_LOCK:
                     if not result_path.exists():
                         result_path.write_bytes(body_inner)
+                run_swap_mark("write_result_cache", t_write_result_cache)
+
+                stage_times_ms.update(run_swap_stage_times_ms)
                 return body_inner, crop_box
 
+            t_cache_check = time.perf_counter()
             with RESULT_LOCK:
                 if result_path.exists() and not only_face_square:
                     body = result_path.read_bytes()
+                    mark("cache_lookup", t_cache_check)
                     self._send_jpeg(body)
-                    self._log_request_timing(request_start, "cache_hit")
+                    self._log_request_timing(request_start, "cache_hit", request_id, stage_times_ms)
                     return
+            mark("cache_lookup", t_cache_check)
 
+            t_exec = time.perf_counter()
             body, crop_box = SWAP_EXECUTOR.submit(_run_swap).result()
+            mark("executor_wait", t_exec)
             if crop_box is not None:
                 left, top, right, bottom = crop_box
                 cookie_value = quote(f"x={left},y={top},w={right - left},h={bottom - top}")
                 self._send_jpeg(body, set_cookie=f"swapped_face_pos={cookie_value}; Path=/; SameSite=Lax")
             else:
                 self._send_jpeg(body)
-            self._log_request_timing(request_start, "processed")
+            self._log_request_timing(request_start, "processed", request_id, stage_times_ms)
         except Exception as exc:
             error = str(exc).encode("utf-8", errors="ignore")
             self.send_response(500)
@@ -502,7 +544,7 @@ class SwapHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(error)))
             self.end_headers()
             self.wfile.write(error)
-            self._log_request_timing(request_start, "error")
+            self._log_request_timing(request_start, "error", request_id, stage_times_ms)
 
     def _send_jpeg(self, body: bytes, set_cookie: str | None = None) -> None:
         self.send_response(200)
@@ -513,9 +555,20 @@ class SwapHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _log_request_timing(self, start: float, outcome: str) -> None:
+    def _log_request_timing(
+        self,
+        start: float,
+        outcome: str,
+        request_id: str,
+        stage_times_ms: dict[str, float] | None = None,
+    ) -> None:
         elapsed_ms = (time.perf_counter() - start) * 1000
-        print(f"[swap] outcome={outcome} elapsed_ms={elapsed_ms:.2f} path={self.path}")
+        if stage_times_ms:
+            stage_parts = [f"{stage}={duration:.2f}ms" for stage, duration in sorted(stage_times_ms.items())]
+            stages_str = " ".join(stage_parts)
+            print(f"[swap] req_id={request_id} outcome={outcome} elapsed_ms={elapsed_ms:.2f} path={self.path} {stages_str}")
+            return
+        print(f"[swap] req_id={request_id} outcome={outcome} elapsed_ms={elapsed_ms:.2f} path={self.path}")
 
 
 def main() -> None:
