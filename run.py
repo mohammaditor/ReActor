@@ -150,7 +150,7 @@ _validate_model_paths()
 _ensure_cache_dirs()
 _install_comfy_stubs()
 
-from scripts.reactor_swapper import swap_face  # noqa: E402
+from scripts.reactor_swapper import analyze_faces, swap_face  # noqa: E402
 
 
 def _is_url(value: str) -> bool:
@@ -422,6 +422,28 @@ class SwapHandler(BaseHTTPRequestHandler):
                     runtime_target_image = Image.open(target_face_cache_file).convert("RGB")
                     used_face_cache = True
                     cached_face_position = _read_face_position(target_face_position_file)
+                elif only_face_square:
+                    import cv2
+                    import numpy as np
+
+                    target_bgr = cv2.cvtColor(np.array(target_img), cv2.COLOR_RGB2BGR)
+                    faces = analyze_faces(target_bgr)
+                    if len(faces) == 0:
+                        raise RuntimeError("No target face found to crop")
+
+                    largest_face = max(
+                        faces,
+                        key=lambda face: max(0.0, float(face.bbox[2] - face.bbox[0])) * max(0.0, float(face.bbox[3] - face.bbox[1])),
+                    )
+                    crop_box = _square_from_bbox(tuple(largest_face.bbox), target_img.width, target_img.height)
+                    runtime_target_image = target_img.crop(crop_box)
+                    cached_face_position = crop_box
+                    used_face_cache = True
+                    with RESULT_LOCK:
+                        if not target_face_cache_file.exists():
+                            runtime_target_image.save(target_face_cache_file, format="PNG")
+                        if not target_face_position_file.exists():
+                            _write_face_position(target_face_position_file, crop_box)
 
                 swapped_img, bboxes, _ = swap_face(
                     source_img=source_img,
