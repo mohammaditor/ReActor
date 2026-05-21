@@ -180,7 +180,12 @@ def _try_decode_base64_image(value: str) -> Image.Image | None:
         return None
 
 
-def _load_image(path_or_url: str, cache_subdir: Path) -> tuple[Image.Image, Path]:
+def _load_image(
+    path_or_url: str,
+    cache_subdir: Path,
+    timing_prefix: str | None = None,
+    timings_out: dict[str, float] | None = None,
+) -> tuple[Image.Image, Path]:
     """
     Load the *current* image for a source/target reference.
 
@@ -189,15 +194,31 @@ def _load_image(path_or_url: str, cache_subdir: Path) -> tuple[Image.Image, Path
     - Always resolve fresh bytes first, then cache by content hash.
     - This guarantees we only reuse cache when source/target content is truly unchanged.
     """
-    cache_subdir.mkdir(parents=True, exist_ok=True)
+    def _mark(stage_name: str, stage_start: float) -> None:
+        if timing_prefix is None or timings_out is None:
+            return
+        timings_out[f"{timing_prefix}_{stage_name}"] = (time.perf_counter() - stage_start) * 1000
 
+    t_mkdir = time.perf_counter()
+    cache_subdir.mkdir(parents=True, exist_ok=True)
+    _mark("mkdir", t_mkdir)
+
+    t_base64 = time.perf_counter()
     decoded_inline_image = _try_decode_base64_image(path_or_url)
+    _mark("base64_decode", t_base64)
     if decoded_inline_image is not None:
+        t_hash = time.perf_counter()
         content_hash = _image_sha256_hex(decoded_inline_image)
+        _mark("hash", t_hash)
         cache_file = cache_subdir / f"{content_hash}.png"
+        t_cache_hit_read = time.perf_counter()
         if cache_file.exists():
-            return Image.open(cache_file).convert("RGB"), cache_file
+            cached_image = Image.open(cache_file).convert("RGB")
+            _mark("cache_hit_read", t_cache_hit_read)
+            return cached_image, cache_file
+        t_cache_write = time.perf_counter()
         decoded_inline_image.save(cache_file, format="PNG")
+        _mark("cache_write", t_cache_write)
         return decoded_inline_image, cache_file
 
     # IMPORTANT:
@@ -207,30 +228,73 @@ def _load_image(path_or_url: str, cache_subdir: Path) -> tuple[Image.Image, Path
     # urllib raises "URL can't contain control characters".
     # So for HTTP(S), keep the URL as-is and do not unquote it again.
     if _is_url(path_or_url):
+        t_url_lookup = time.perf_counter()
+        url_key = _sha256_hex(path_or_url)
+        url_map_dir = cache_subdir / "_url_index"
+        url_map_dir.mkdir(parents=True, exist_ok=True)
+        url_map_file = url_map_dir / f"{url_key}.txt"
+        if url_map_file.exists():
+            try:
+                cached_hash = url_map_file.read_text(encoding="utf-8").strip()
+                if cached_hash:
+                    cache_file = cache_subdir / f"{cached_hash}.png"
+                    if cache_file.exists():
+                        cached_image = Image.open(cache_file).convert("RGB")
+                        _mark("url_cache_hit_read", t_url_lookup)
+                        return cached_image, cache_file
+            except Exception:
+                pass
+        _mark("url_cache_lookup", t_url_lookup)
+
+        t_download = time.perf_counter()
         req = Request(path_or_url, headers={"User-Agent": "ReActor-Standalone/1.0"})
         with urlopen(req, timeout=60, context=SSL_CONTEXT) as response:
             data = response.read()
+        _mark("download", t_download)
 
+        t_decode = time.perf_counter()
         image = Image.open(io.BytesIO(data)).convert("RGB")
+        _mark("decode", t_decode)
+        t_hash = time.perf_counter()
         content_hash = _image_sha256_hex(image)
+        _mark("hash", t_hash)
         cache_file = cache_subdir / f"{content_hash}.png"
+        t_cache_write = time.perf_counter()
         if not cache_file.exists():
             image.save(cache_file, format="PNG")
+        _mark("cache_write_if_miss", t_cache_write)
+        t_url_index_write = time.perf_counter()
+        try:
+            url_map_file.write_text(content_hash, encoding="utf-8")
+        except Exception:
+            pass
+        _mark("url_cache_index_write", t_url_index_write)
         return image, cache_file
 
+    t_unquote = time.perf_counter()
     val = unquote(path_or_url)
+    _mark("unquote", t_unquote)
     img_path = Path(val)
     if not img_path.is_absolute():
         img_path = Path.cwd() / img_path
     if not img_path.exists():
         raise FileNotFoundError(f"Image not found: {img_path}")
 
+    t_local_open = time.perf_counter()
     local_img = Image.open(img_path).convert("RGB")
+    _mark("local_open", t_local_open)
+    t_hash = time.perf_counter()
     content_hash = _image_sha256_hex(local_img)
+    _mark("hash", t_hash)
     cache_file = cache_subdir / f"{content_hash}.png"
+    t_cache_hit_read = time.perf_counter()
     if cache_file.exists():
-        return Image.open(cache_file).convert("RGB"), cache_file
+        cached_image = Image.open(cache_file).convert("RGB")
+        _mark("cache_hit_read", t_cache_hit_read)
+        return cached_image, cache_file
+    t_cache_write = time.perf_counter()
     local_img.save(cache_file, format="PNG")
+    _mark("cache_write", t_cache_write)
     return local_img, cache_file
 
 
@@ -394,7 +458,7 @@ class SwapHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         if parsed.path not in {"/swap", "/swap_face_square"}:
             self.send_error(404, "Use /swap or /swap_face_square")
-            self._log_request_timing(request_start, "invalid_path")
+            self._log_request_timing(request_start, "invalid_path", request_id, stage_times_ms)
             return
 
         params = parse_qs(parsed.query)
@@ -403,7 +467,7 @@ class SwapHandler(BaseHTTPRequestHandler):
         target_url = params.get("target_url", [None])[0]
         if not source_url or not target_url:
             self.send_error(400, "source_url and target_url are required")
-            self._log_request_timing(request_start, "missing_required_params")
+            self._log_request_timing(request_start, "missing_required_params", request_id, stage_times_ms)
             return
 
         try:
@@ -412,11 +476,21 @@ class SwapHandler(BaseHTTPRequestHandler):
             mark("parse_options", t_stage)
 
             t_stage = time.perf_counter()
-            source_img, _ = _load_image(source_url, SOURCES_CACHE_DIR)
+            source_img, _ = _load_image(
+                source_url,
+                SOURCES_CACHE_DIR,
+                timing_prefix="source_load",
+                timings_out=stage_times_ms,
+            )
             mark("load_source", t_stage)
 
             t_stage = time.perf_counter()
-            target_img, target_cache_file = _load_image(target_url, TARGETS_CACHE_DIR)
+            target_img, target_cache_file = _load_image(
+                target_url,
+                TARGETS_CACHE_DIR,
+                timing_prefix="target_load",
+                timings_out=stage_times_ms,
+            )
             mark("load_target", t_stage)
 
             t_stage = time.perf_counter()
