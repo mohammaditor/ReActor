@@ -11,6 +11,7 @@ from reactor_core.face_objects import Face
 from safetensors.torch import save_file, safe_open
 from tqdm import tqdm
 import urllib.request
+import ssl
 import onnxruntime
 from typing import Any
 import folder_paths
@@ -139,10 +140,15 @@ def rgba2rgb_tensor(rgba):
 
 
 def download(url, path, name):
-    request = urllib.request.urlopen(url)
+    ssl_context = ssl._create_unverified_context()
+    request = urllib.request.urlopen(url, context=ssl_context)
     total = int(request.headers.get('Content-Length', 0))
     with tqdm(total=total, desc=f'[ReActor] Downloading {name} to {path}', unit='B', unit_scale=True, unit_divisor=1024) as progress:
-        urllib.request.urlretrieve(url, path, reporthook=lambda count, block_size, total_size: progress.update(block_size))
+        urllib.request.urlretrieve(
+            url,
+            path,
+            reporthook=lambda count, block_size, total_size: progress.update(block_size),
+        )
 
 
 def move_path(old_path, new_path):
