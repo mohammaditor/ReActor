@@ -179,7 +179,7 @@ def _try_decode_base64_image(value: str) -> Image.Image | None:
         return None
 
 
-def _load_image(path_or_url: str, cache_subdir: Path) -> Image.Image:
+def _load_image(path_or_url: str, cache_subdir: Path) -> tuple[Image.Image, Path]:
     """
     Load the *current* image for a source/target reference.
 
@@ -195,9 +195,9 @@ def _load_image(path_or_url: str, cache_subdir: Path) -> Image.Image:
         content_hash = _image_sha256_hex(decoded_inline_image)
         cache_file = cache_subdir / f"{content_hash}.png"
         if cache_file.exists():
-            return Image.open(cache_file).convert("RGB")
+            return Image.open(cache_file).convert("RGB"), cache_file
         decoded_inline_image.save(cache_file, format="PNG")
-        return decoded_inline_image
+        return decoded_inline_image, cache_file
 
     # IMPORTANT:
     # - query parsing already decodes URL parameters once.
@@ -215,7 +215,7 @@ def _load_image(path_or_url: str, cache_subdir: Path) -> Image.Image:
         cache_file = cache_subdir / f"{content_hash}.png"
         if not cache_file.exists():
             image.save(cache_file, format="PNG")
-        return image
+        return image, cache_file
 
     val = unquote(path_or_url)
     img_path = Path(val)
@@ -228,9 +228,38 @@ def _load_image(path_or_url: str, cache_subdir: Path) -> Image.Image:
     content_hash = _image_sha256_hex(local_img)
     cache_file = cache_subdir / f"{content_hash}.png"
     if cache_file.exists():
-        return Image.open(cache_file).convert("RGB")
+        return Image.open(cache_file).convert("RGB"), cache_file
     local_img.save(cache_file, format="PNG")
-    return local_img
+    return local_img, cache_file
+
+
+def _face_cache_path_for_target(target_cache_file: Path) -> Path:
+    return target_cache_file.with_name(f"{target_cache_file.stem}_face.png")
+
+
+def _face_position_cache_path_for_target(target_cache_file: Path) -> Path:
+    return target_cache_file.with_name(f"{target_cache_file.stem}_face.txt")
+
+
+def _read_face_position(path: Path) -> tuple[int, int, int, int] | None:
+    if not path.exists():
+        return None
+    try:
+        raw = path.read_text(encoding="utf-8").strip()
+        parts = [int(v.strip()) for v in raw.split(",")]
+        if len(parts) != 4:
+            return None
+        left, top, right, bottom = parts
+        if right <= left or bottom <= top:
+            return None
+        return left, top, right, bottom
+    except Exception:
+        return None
+
+
+def _write_face_position(path: Path, crop_box: tuple[int, int, int, int]) -> None:
+    left, top, right, bottom = crop_box
+    path.write_text(f"{left},{top},{right},{bottom}", encoding="utf-8")
 
 
 def _square_from_bbox(bbox: tuple[float, float, float, float], width: int, height: int) -> tuple[int, int, int, int]:
@@ -372,10 +401,12 @@ class SwapHandler(BaseHTTPRequestHandler):
 
         try:
             swap_options = _build_swap_options(params)
-            source_img = _load_image(source_url, SOURCES_CACHE_DIR)
-            target_img = _load_image(target_url, TARGETS_CACHE_DIR)
+            source_img, _ = _load_image(source_url, SOURCES_CACHE_DIR)
+            target_img, target_cache_file = _load_image(target_url, TARGETS_CACHE_DIR)
             source_hash = _image_sha256_hex(source_img)
             target_hash = _image_sha256_hex(target_img)
+            target_face_cache_file = _face_cache_path_for_target(target_cache_file)
+            target_face_position_file = _face_position_cache_path_for_target(target_cache_file)
             source_result_dir = RESULTS_CACHE_DIR / source_hash
             source_result_dir.mkdir(parents=True, exist_ok=True)
             cache_key = _sha256_hex(
@@ -384,9 +415,17 @@ class SwapHandler(BaseHTTPRequestHandler):
             result_path = source_result_dir / f"{cache_key}.jpg"
 
             def _run_swap() -> tuple[bytes, tuple[int, int, int, int] | None]:
+                runtime_target_image = target_img
+                used_face_cache = False
+                cached_face_position = None
+                if only_face_square and target_face_cache_file.exists():
+                    runtime_target_image = Image.open(target_face_cache_file).convert("RGB")
+                    used_face_cache = True
+                    cached_face_position = _read_face_position(target_face_position_file)
+
                 swapped_img, bboxes, _ = swap_face(
                     source_img=source_img,
-                    target_img=target_img,
+                    target_img=runtime_target_image,
                     model=self.model_path,
                     **swap_options,
                 )
@@ -394,10 +433,18 @@ class SwapHandler(BaseHTTPRequestHandler):
                 crop_box = None
                 output_image = swapped_img
                 if only_face_square:
-                    if not bboxes:
-                        raise RuntimeError("No swapped target face found to crop")
-                    crop_box = _square_from_bbox(tuple(bboxes[0]), swapped_img.width, swapped_img.height)
-                    output_image = swapped_img.crop(crop_box)
+                    if used_face_cache:
+                        crop_box = cached_face_position
+                    else:
+                        if not bboxes:
+                            raise RuntimeError("No swapped target face found to crop")
+                        crop_box = _square_from_bbox(tuple(bboxes[0]), swapped_img.width, swapped_img.height)
+                        output_image = swapped_img.crop(crop_box)
+                        with RESULT_LOCK:
+                            if not target_face_cache_file.exists():
+                                output_image.save(target_face_cache_file, format="PNG")
+                            if not target_face_position_file.exists():
+                                _write_face_position(target_face_position_file, crop_box)
 
                 output = io.BytesIO()
                 output_image.save(output, format="JPEG", quality=95)
