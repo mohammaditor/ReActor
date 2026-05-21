@@ -419,6 +419,9 @@ class SwapHandler(BaseHTTPRequestHandler):
                 used_face_cache = False
                 cached_face_position = None
                 if only_face_square and target_face_cache_file.exists():
+                    # IMPORTANT:
+                    # When sidecar face cache exists, /swap_face_square must run ONLY on that file.
+                    # We do not analyze/crop/use full target image in this branch.
                     runtime_target_image = Image.open(target_face_cache_file).convert("RGB")
                     used_face_cache = True
                     cached_face_position = _read_face_position(target_face_position_file)
