@@ -6,7 +6,7 @@ import threading
 import time
 import types
 from pathlib import Path
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 from urllib.request import Request, urlopen
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from concurrent.futures import ThreadPoolExecutor
@@ -231,6 +231,46 @@ def _load_image(path_or_url: str, cache_subdir: Path) -> Image.Image:
     return local_img
 
 
+def _square_from_bbox(bbox: tuple[float, float, float, float], width: int, height: int) -> tuple[int, int, int, int]:
+    x1, y1, x2, y2 = bbox
+    cx = (x1 + x2) / 2.0
+    cy = (y1 + y2) / 2.0
+    side = max(x2 - x1, y2 - y1)
+    side = max(1, int(round(side)))
+
+    left = int(round(cx - side / 2.0))
+    top = int(round(cy - side / 2.0))
+    right = left + side
+    bottom = top + side
+
+    if left < 0:
+        right -= left
+        left = 0
+    if top < 0:
+        bottom -= top
+        top = 0
+    if right > width:
+        shift = right - width
+        left -= shift
+        right = width
+    if bottom > height:
+        shift = bottom - height
+        top -= shift
+        bottom = height
+
+    left = max(0, left)
+    top = max(0, top)
+    right = min(width, right)
+    bottom = min(height, bottom)
+
+    if right <= left:
+        right = min(width, left + 1)
+    if bottom <= top:
+        bottom = min(height, top + 1)
+
+    return left, top, right, bottom
+
+
 def _pick_swap_model() -> str:
     if SWAP_MODEL_PATH is not None:
         model_path = Path(SWAP_MODEL_PATH)
@@ -314,12 +354,13 @@ class SwapHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         request_start = time.perf_counter()
         parsed = urlparse(self.path)
-        if parsed.path != "/swap":
-            self.send_error(404, "Use /swap")
+        if parsed.path not in {"/swap", "/swap_face_square"}:
+            self.send_error(404, "Use /swap or /swap_face_square")
             self._log_request_timing(request_start, "invalid_path")
             return
 
         params = parse_qs(parsed.query)
+        only_face_square = parsed.path == "/swap_face_square"
         source_url = params.get("source_url", [None])[0]
         target_url = params.get("target_url", [None])[0]
         if not source_url or not target_url:
@@ -336,34 +377,48 @@ class SwapHandler(BaseHTTPRequestHandler):
             source_result_dir = RESULTS_CACHE_DIR / source_hash
             source_result_dir.mkdir(parents=True, exist_ok=True)
             cache_key = _sha256_hex(
-                f"source={source_hash}|target={target_hash}|opts={repr(sorted(swap_options.items()))}|model={self.model_path}"
+                f"source={source_hash}|target={target_hash}|opts={repr(sorted(swap_options.items()))}|model={self.model_path}|mode={'square' if only_face_square else 'full'}"
             )
             result_path = source_result_dir / f"{cache_key}.jpg"
 
-            def _run_swap() -> bytes:
-                swapped_img, _, _ = swap_face(
+            def _run_swap() -> tuple[bytes, tuple[int, int, int, int] | None]:
+                swapped_img, bboxes, _ = swap_face(
                     source_img=source_img,
                     target_img=target_img,
                     model=self.model_path,
                     **swap_options,
                 )
+
+                crop_box = None
+                output_image = swapped_img
+                if only_face_square:
+                    if not bboxes:
+                        raise RuntimeError("No swapped target face found to crop")
+                    crop_box = _square_from_bbox(tuple(bboxes[0]), swapped_img.width, swapped_img.height)
+                    output_image = swapped_img.crop(crop_box)
+
                 output = io.BytesIO()
-                swapped_img.save(output, format="JPEG", quality=95)
+                output_image.save(output, format="JPEG", quality=95)
                 body_inner = output.getvalue()
                 with RESULT_LOCK:
                     if not result_path.exists():
                         result_path.write_bytes(body_inner)
-                return body_inner
+                return body_inner, crop_box
 
             with RESULT_LOCK:
-                if result_path.exists():
+                if result_path.exists() and not only_face_square:
                     body = result_path.read_bytes()
                     self._send_jpeg(body)
                     self._log_request_timing(request_start, "cache_hit")
                     return
 
-            body = SWAP_EXECUTOR.submit(_run_swap).result()
-            self._send_jpeg(body)
+            body, crop_box = SWAP_EXECUTOR.submit(_run_swap).result()
+            if crop_box is not None:
+                left, top, right, bottom = crop_box
+                cookie_value = quote(f"x={left},y={top},w={right - left},h={bottom - top}")
+                self._send_jpeg(body, set_cookie=f"swapped_face_pos={cookie_value}; Path=/; SameSite=Lax")
+            else:
+                self._send_jpeg(body)
             self._log_request_timing(request_start, "processed")
         except Exception as exc:
             error = str(exc).encode("utf-8", errors="ignore")
@@ -374,10 +429,12 @@ class SwapHandler(BaseHTTPRequestHandler):
             self.wfile.write(error)
             self._log_request_timing(request_start, "error")
 
-    def _send_jpeg(self, body: bytes) -> None:
+    def _send_jpeg(self, body: bytes, set_cookie: str | None = None) -> None:
         self.send_response(200)
         self.send_header("Content-Type", "image/jpeg")
         self.send_header("Content-Length", str(len(body)))
+        if set_cookie is not None:
+            self.send_header("Set-Cookie", set_cookie)
         self.end_headers()
         self.wfile.write(body)
 
