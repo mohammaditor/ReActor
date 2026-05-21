@@ -5,6 +5,7 @@ import sys
 import threading
 import time
 import types
+import ssl
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlparse
 from urllib.request import Request, urlopen
@@ -51,6 +52,7 @@ RESULTS_CACHE_DIR = CACHE_DIR / "results"
 
 SWAP_EXECUTOR = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_REQUESTS)
 RESULT_LOCK = threading.Lock()
+SSL_CONTEXT = ssl._create_unverified_context()
 
 
 def _ensure_cache_dirs() -> None:
@@ -205,7 +207,7 @@ def _load_image(path_or_url: str, cache_subdir: Path) -> Image.Image:
     # So for HTTP(S), keep the URL as-is and do not unquote it again.
     if _is_url(path_or_url):
         req = Request(path_or_url, headers={"User-Agent": "ReActor-Standalone/1.0"})
-        with urlopen(req, timeout=60) as response:
+        with urlopen(req, timeout=60, context=SSL_CONTEXT) as response:
             data = response.read()
 
         image = Image.open(io.BytesIO(data)).convert("RGB")
