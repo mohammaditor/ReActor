@@ -442,7 +442,8 @@ class SwapHandler(BaseHTTPRequestHandler):
                         output_image = swapped_img.crop(crop_box)
                         with RESULT_LOCK:
                             if not target_face_cache_file.exists():
-                                output_image.save(target_face_cache_file, format="PNG")
+                                raw_target_face = target_img.crop(crop_box)
+                                raw_target_face.save(target_face_cache_file, format="PNG")
                             if not target_face_position_file.exists():
                                 _write_face_position(target_face_position_file, crop_box)
 
