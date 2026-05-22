@@ -12,6 +12,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlparse
 from urllib.request import Request, urlopen
 from urllib.error import URLError, HTTPError
+import requests
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from concurrent.futures import ThreadPoolExecutor
 
@@ -249,52 +250,40 @@ def _load_image(
         _mark("url_cache_lookup", t_url_lookup)
 
         t_download = time.perf_counter()
-        req = Request(path_or_url, headers={"User-Agent": "ReActor-Standalone/1.0"})
         parsed_url = urlparse(path_or_url)
 
-        def _download(request: Request, use_ssl_context: bool) -> bytes:
+        def _download_with_urllib(request_url: str, use_ssl_context: bool) -> bytes:
+            req = Request(request_url, headers={"User-Agent": "ReActor-Standalone/1.0"})
             if use_ssl_context:
-                with urlopen(request, timeout=60, context=SSL_CONTEXT) as response:
+                with urlopen(req, timeout=60, context=SSL_CONTEXT) as response:
                     return response.read()
-            with urlopen(request, timeout=60) as response:
+            with urlopen(req, timeout=60) as response:
                 return response.read()
 
         try:
-            data = _download(req, use_ssl_context=True)
-        except (ssl.SSLError, URLError) as exc:
-            is_ssl_related = isinstance(exc, ssl.SSLError) or isinstance(getattr(exc, "reason", None), ssl.SSLError)
-            if parsed_url.scheme != "https" or not is_ssl_related:
-                raise
-
-            # Some endpoints succeed in browsers after manual certificate override
-            # but still fail in Python's TLS stack. Retry HTTPS via curl -k first.
+            response = requests.get(
+                path_or_url,
+                timeout=60,
+                verify=False,
+                headers={"User-Agent": "ReActor-Standalone/1.0"},
+                allow_redirects=True,
+            )
+            response.raise_for_status()
+            data = response.content
+        except requests.exceptions.RequestException as req_exc:
+            # Fallback to urllib path in case requests fails due to environment quirks.
             try:
-                curl_result = subprocess.run(
-                    [
-                        "curl",
-                        "--fail",
-                        "--location",
-                        "--silent",
-                        "--show-error",
-                        "--insecure",
-                        "--max-time",
-                        "60",
-                        "--user-agent",
-                        "ReActor-Standalone/1.0",
-                        path_or_url,
-                    ],
-                    check=True,
-                    capture_output=True,
-                )
-                data = curl_result.stdout
-            except Exception:
+                data = _download_with_urllib(path_or_url, use_ssl_context=True)
+            except (ssl.SSLError, URLError) as exc:
+                is_ssl_related = isinstance(exc, ssl.SSLError) or isinstance(getattr(exc, "reason", None), ssl.SSLError)
+                if parsed_url.scheme != "https" or not is_ssl_related:
+                    raise RuntimeError(f"Failed to download image: {req_exc}") from req_exc
                 insecure_url = parsed_url._replace(scheme="http").geturl()
-                fallback_req = Request(insecure_url, headers={"User-Agent": "ReActor-Standalone/1.0"})
                 try:
-                    data = _download(fallback_req, use_ssl_context=False)
+                    data = _download_with_urllib(insecure_url, use_ssl_context=False)
                 except (URLError, HTTPError) as fallback_exc:
                     raise RuntimeError(
-                        f"Failed to download image via HTTPS (SSL error), curl -k HTTPS retry, and HTTP fallback. "
+                        f"Failed to download image via requests(verify=False), urllib HTTPS, and HTTP fallback. "
                         f"https_url={path_or_url} http_url={insecure_url} fallback_error={fallback_exc}"
                     ) from fallback_exc
         _mark("download", t_download)
