@@ -3,3 +3,6 @@ __pycache__/
 .vscode/
 example
 input
+_models/*
+venv/
+venv/*
