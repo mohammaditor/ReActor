@@ -25,7 +25,7 @@ REPO_MODELS_DIR = REPO_ROOT / "models"
 # reactor_swapper has legacy migration logic that treats ./models as an old path
 # and may try to move/remove it on startup.
 # Use another directory, e.g. r"D:/Ai/AiTest/ReActorModels".
-MODELS_DIR = Path(r"D:/Ai/AiTest/ReActor/_models")
+MODELS_DIR = Path(r"E:/ReActor/_models")
 
 # Optional: set a direct model file path (.onnx/.pth). If None, auto-discovery is used.
 SWAP_MODEL_PATH = None
@@ -34,7 +34,7 @@ SWAP_MODEL_PATH = None
 # - "gpu": forces torch device to "cuda".
 # - "cpu": forces torch device to "cpu".
 # - You can also set REACTOR_DEVICE env var to override at runtime.
-DEVICE_MODE = "gpu"
+DEVICE_MODE = "cpu"
 
 # Concurrency limit for simultaneous /swap processing.
 # Even if 20+ requests arrive together, only this many are processed concurrently.
