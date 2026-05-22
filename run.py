@@ -10,6 +10,7 @@ import ssl
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlparse
 from urllib.request import Request, urlopen
+from urllib.error import URLError
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from concurrent.futures import ThreadPoolExecutor
 
@@ -248,8 +249,26 @@ def _load_image(
 
         t_download = time.perf_counter()
         req = Request(path_or_url, headers={"User-Agent": "ReActor-Standalone/1.0"})
-        with urlopen(req, timeout=60, context=SSL_CONTEXT) as response:
-            data = response.read()
+        parsed_url = urlparse(path_or_url)
+        try:
+            with urlopen(req, timeout=60, context=SSL_CONTEXT) as response:
+                data = response.read()
+        except ssl.SSLError:
+            if parsed_url.scheme != "https":
+                raise
+            # If SSL handshake fails for any reason, retry once via plain HTTP.
+            insecure_url = parsed_url._replace(scheme="http").geturl()
+            fallback_req = Request(insecure_url, headers={"User-Agent": "ReActor-Standalone/1.0"})
+            with urlopen(fallback_req, timeout=60) as response:
+                data = response.read()
+        except URLError as exc:
+            # urllib may wrap SSL errors inside URLError(reason=SSLError(...)).
+            if parsed_url.scheme != "https" or not isinstance(getattr(exc, "reason", None), ssl.SSLError):
+                raise
+            insecure_url = parsed_url._replace(scheme="http").geturl()
+            fallback_req = Request(insecure_url, headers={"User-Agent": "ReActor-Standalone/1.0"})
+            with urlopen(fallback_req, timeout=60) as response:
+                data = response.read()
         _mark("download", t_download)
 
         t_decode = time.perf_counter()
