@@ -7,6 +7,7 @@ import time
 import uuid
 import types
 import ssl
+import subprocess
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlparse
 from urllib.request import Request, urlopen
@@ -264,15 +265,38 @@ def _load_image(
             is_ssl_related = isinstance(exc, ssl.SSLError) or isinstance(getattr(exc, "reason", None), ssl.SSLError)
             if parsed_url.scheme != "https" or not is_ssl_related:
                 raise
-            insecure_url = parsed_url._replace(scheme="http").geturl()
-            fallback_req = Request(insecure_url, headers={"User-Agent": "ReActor-Standalone/1.0"})
+
+            # Some endpoints succeed in browsers after manual certificate override
+            # but still fail in Python's TLS stack. Retry HTTPS via curl -k first.
             try:
-                data = _download(fallback_req, use_ssl_context=False)
-            except (URLError, HTTPError) as fallback_exc:
-                raise RuntimeError(
-                    f"Failed to download image via HTTPS (SSL error) and HTTP fallback. "
-                    f"https_url={path_or_url} http_url={insecure_url} fallback_error={fallback_exc}"
-                ) from fallback_exc
+                curl_result = subprocess.run(
+                    [
+                        "curl",
+                        "--fail",
+                        "--location",
+                        "--silent",
+                        "--show-error",
+                        "--insecure",
+                        "--max-time",
+                        "60",
+                        "--user-agent",
+                        "ReActor-Standalone/1.0",
+                        path_or_url,
+                    ],
+                    check=True,
+                    capture_output=True,
+                )
+                data = curl_result.stdout
+            except Exception:
+                insecure_url = parsed_url._replace(scheme="http").geturl()
+                fallback_req = Request(insecure_url, headers={"User-Agent": "ReActor-Standalone/1.0"})
+                try:
+                    data = _download(fallback_req, use_ssl_context=False)
+                except (URLError, HTTPError) as fallback_exc:
+                    raise RuntimeError(
+                        f"Failed to download image via HTTPS (SSL error), curl -k HTTPS retry, and HTTP fallback. "
+                        f"https_url={path_or_url} http_url={insecure_url} fallback_error={fallback_exc}"
+                    ) from fallback_exc
         _mark("download", t_download)
 
         t_decode = time.perf_counter()
