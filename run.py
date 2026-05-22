@@ -10,6 +10,8 @@ import ssl
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlparse
 from urllib.request import Request, urlopen
+from urllib.error import URLError, HTTPError
+import requests
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from concurrent.futures import ThreadPoolExecutor
 
@@ -247,9 +249,42 @@ def _load_image(
         _mark("url_cache_lookup", t_url_lookup)
 
         t_download = time.perf_counter()
-        req = Request(path_or_url, headers={"User-Agent": "ReActor-Standalone/1.0"})
-        with urlopen(req, timeout=60, context=SSL_CONTEXT) as response:
-            data = response.read()
+        parsed_url = urlparse(path_or_url)
+
+        def _download_with_urllib(request_url: str, use_ssl_context: bool) -> bytes:
+            req = Request(request_url, headers={"User-Agent": "ReActor-Standalone/1.0"})
+            if use_ssl_context:
+                with urlopen(req, timeout=60, context=SSL_CONTEXT) as response:
+                    return response.read()
+            with urlopen(req, timeout=60) as response:
+                return response.read()
+
+        try:
+            response = requests.get(
+                path_or_url,
+                timeout=60,
+                verify=False,
+                headers={"User-Agent": "ReActor-Standalone/1.0"},
+                allow_redirects=True,
+            )
+            response.raise_for_status()
+            data = response.content
+        except requests.exceptions.RequestException as req_exc:
+            # Fallback to urllib path in case requests fails due to environment quirks.
+            try:
+                data = _download_with_urllib(path_or_url, use_ssl_context=True)
+            except (ssl.SSLError, URLError) as exc:
+                is_ssl_related = isinstance(exc, ssl.SSLError) or isinstance(getattr(exc, "reason", None), ssl.SSLError)
+                if parsed_url.scheme != "https" or not is_ssl_related:
+                    raise RuntimeError(f"Failed to download image: {req_exc}") from req_exc
+                insecure_url = parsed_url._replace(scheme="http").geturl()
+                try:
+                    data = _download_with_urllib(insecure_url, use_ssl_context=False)
+                except (URLError, HTTPError) as fallback_exc:
+                    raise RuntimeError(
+                        f"Failed to download image via requests(verify=False), urllib HTTPS, and HTTP fallback. "
+                        f"https_url={path_or_url} http_url={insecure_url} fallback_error={fallback_exc}"
+                    ) from fallback_exc
         _mark("download", t_download)
 
         t_decode = time.perf_counter()
@@ -613,7 +648,8 @@ class SwapHandler(BaseHTTPRequestHandler):
             self._log_request_timing(request_start, "processed", request_id, stage_times_ms)
         except Exception as exc:
             error = str(exc).encode("utf-8", errors="ignore")
-            self.send_response(500)
+            status_code = 502 if isinstance(exc, RuntimeError) and str(exc).startswith("Failed to download image") else 500
+            self.send_response(status_code)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
             self.send_header("Content-Length", str(len(error)))
             self.end_headers()
