@@ -10,6 +10,7 @@ import ssl
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlparse
 from urllib.request import Request, urlopen
+from urllib.error import URLError, HTTPError
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from concurrent.futures import ThreadPoolExecutor
 
@@ -248,8 +249,30 @@ def _load_image(
 
         t_download = time.perf_counter()
         req = Request(path_or_url, headers={"User-Agent": "ReActor-Standalone/1.0"})
-        with urlopen(req, timeout=60, context=SSL_CONTEXT) as response:
-            data = response.read()
+        parsed_url = urlparse(path_or_url)
+
+        def _download(request: Request, use_ssl_context: bool) -> bytes:
+            if use_ssl_context:
+                with urlopen(request, timeout=60, context=SSL_CONTEXT) as response:
+                    return response.read()
+            with urlopen(request, timeout=60) as response:
+                return response.read()
+
+        try:
+            data = _download(req, use_ssl_context=True)
+        except (ssl.SSLError, URLError) as exc:
+            is_ssl_related = isinstance(exc, ssl.SSLError) or isinstance(getattr(exc, "reason", None), ssl.SSLError)
+            if parsed_url.scheme != "https" or not is_ssl_related:
+                raise
+            insecure_url = parsed_url._replace(scheme="http").geturl()
+            fallback_req = Request(insecure_url, headers={"User-Agent": "ReActor-Standalone/1.0"})
+            try:
+                data = _download(fallback_req, use_ssl_context=False)
+            except (URLError, HTTPError) as fallback_exc:
+                raise RuntimeError(
+                    f"Failed to download image via HTTPS (SSL error) and HTTP fallback. "
+                    f"https_url={path_or_url} http_url={insecure_url} fallback_error={fallback_exc}"
+                ) from fallback_exc
         _mark("download", t_download)
 
         t_decode = time.perf_counter()
@@ -613,7 +636,8 @@ class SwapHandler(BaseHTTPRequestHandler):
             self._log_request_timing(request_start, "processed", request_id, stage_times_ms)
         except Exception as exc:
             error = str(exc).encode("utf-8", errors="ignore")
-            self.send_response(500)
+            status_code = 502 if isinstance(exc, RuntimeError) and str(exc).startswith("Failed to download image") else 500
+            self.send_response(status_code)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
             self.send_header("Content-Length", str(len(error)))
             self.end_headers()
