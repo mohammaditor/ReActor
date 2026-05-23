@@ -52,17 +52,20 @@ CACHE_DIR = REPO_ROOT / "cache"
 SOURCES_CACHE_DIR = CACHE_DIR / "sources"
 TARGETS_CACHE_DIR = CACHE_DIR / "targets"
 RESULTS_CACHE_DIR = CACHE_DIR / "results"
+TMP_CACHE_DIR = CACHE_DIR / "tmp"
 # ===============================================================
 
 SWAP_EXECUTOR = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_REQUESTS)
 RESULT_LOCK = threading.Lock()
 SSL_CONTEXT = ssl._create_unverified_context()
+KNOWN_HOSTING_IP = "45.149.77.233"
 
 
 def _ensure_cache_dirs() -> None:
     SOURCES_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     TARGETS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     RESULTS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    TMP_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def _sha256_hex(value: str) -> str:
@@ -183,6 +186,57 @@ def _try_decode_base64_image(value: str) -> Image.Image | None:
         return None
 
 
+
+
+
+def _build_direct_ip_url(path_or_url: str, direct_ip: str) -> tuple[str, str] | None:
+    if not _is_url(path_or_url):
+        return None
+
+    parsed = urlparse(path_or_url)
+    if not parsed.hostname:
+        return None
+
+    direct_url = parsed._replace(netloc=f"{direct_ip}:{parsed.port}" if parsed.port else direct_ip).geturl()
+    return direct_url, parsed.hostname
+
+def _resolve_tmp_cached_url_image(path_or_url: str) -> Path | None:
+    if not _is_url(path_or_url):
+        return None
+
+    parsed_url = urlparse(path_or_url)
+    raw_path = parsed_url.path
+    if not raw_path:
+        return None
+
+    decoded_path = unquote(raw_path)
+    candidate_paths = [Path(raw_path)]
+    if decoded_path and decoded_path != raw_path:
+        candidate_paths.append(Path(decoded_path))
+
+    checked_rel_paths: list[Path] = []
+    for candidate_path in candidate_paths:
+        file_name = candidate_path.name
+        if not file_name:
+            continue
+
+        rel_file_only = Path(file_name)
+        if rel_file_only not in checked_rel_paths:
+            checked_rel_paths.append(rel_file_only)
+
+        parent_name = candidate_path.parent.name
+        if parent_name:
+            rel_with_parent = Path(parent_name) / file_name
+            if rel_with_parent not in checked_rel_paths:
+                checked_rel_paths.append(rel_with_parent)
+
+    for rel_path in checked_rel_paths:
+        candidate_path = TMP_CACHE_DIR / rel_path
+        if candidate_path.exists() and candidate_path.is_file():
+            return candidate_path
+
+    return None
+
 def _load_image(
     path_or_url: str,
     cache_subdir: Path,
@@ -249,11 +303,41 @@ def _load_image(
                 pass
         _mark("url_cache_lookup", t_url_lookup)
 
+        t_tmp_lookup = time.perf_counter()
+        tmp_cached_file = _resolve_tmp_cached_url_image(path_or_url)
+        _mark("tmp_lookup", t_tmp_lookup)
+        if tmp_cached_file is not None:
+            t_tmp_open = time.perf_counter()
+            image = Image.open(tmp_cached_file).convert("RGB")
+            _mark("tmp_open", t_tmp_open)
+            t_hash = time.perf_counter()
+            content_hash = _image_sha256_hex(image)
+            _mark("hash", t_hash)
+            cache_file = cache_subdir / f"{content_hash}.png"
+            t_cache_write = time.perf_counter()
+            if not cache_file.exists():
+                image.save(cache_file, format="PNG")
+            _mark("cache_write_if_miss", t_cache_write)
+            t_url_index_write = time.perf_counter()
+            try:
+                url_map_file.write_text(content_hash, encoding="utf-8")
+            except Exception:
+                pass
+            _mark("url_cache_index_write", t_url_index_write)
+            return image, cache_file
+
         t_download = time.perf_counter()
         parsed_url = urlparse(path_or_url)
 
-        def _download_with_urllib(request_url: str, use_ssl_context: bool) -> bytes:
-            req = Request(request_url, headers={"User-Agent": "ReActor-Standalone/1.0"})
+        direct_ip_url_info = _build_direct_ip_url(path_or_url, KNOWN_HOSTING_IP)
+        request_url = direct_ip_url_info[0] if direct_ip_url_info is not None else path_or_url
+        request_host = direct_ip_url_info[1] if direct_ip_url_info is not None else None
+
+        def _download_with_urllib(request_url: str, use_ssl_context: bool, host_header: str | None = None) -> bytes:
+            req_headers = {"User-Agent": "ReActor-Standalone/1.0"}
+            if host_header:
+                req_headers["Host"] = host_header
+            req = Request(request_url, headers=req_headers)
             if use_ssl_context:
                 with urlopen(req, timeout=60, context=SSL_CONTEXT) as response:
                     return response.read()
@@ -261,11 +345,15 @@ def _load_image(
                 return response.read()
 
         try:
+            request_headers = {"User-Agent": "ReActor-Standalone/1.0"}
+            if request_host:
+                request_headers["Host"] = request_host
+
             response = requests.get(
-                path_or_url,
+                request_url,
                 timeout=60,
                 verify=False,
-                headers={"User-Agent": "ReActor-Standalone/1.0"},
+                headers=request_headers,
                 allow_redirects=True,
             )
             response.raise_for_status()
@@ -273,14 +361,14 @@ def _load_image(
         except requests.exceptions.RequestException as req_exc:
             # Fallback to urllib path in case requests fails due to environment quirks.
             try:
-                data = _download_with_urllib(path_or_url, use_ssl_context=True)
+                data = _download_with_urllib(request_url, use_ssl_context=True, host_header=request_host)
             except (ssl.SSLError, URLError) as exc:
                 is_ssl_related = isinstance(exc, ssl.SSLError) or isinstance(getattr(exc, "reason", None), ssl.SSLError)
                 if parsed_url.scheme != "https" or not is_ssl_related:
                     raise RuntimeError(f"Failed to download image: {req_exc}") from req_exc
-                insecure_url = parsed_url._replace(scheme="http").geturl()
+                insecure_url = request_url if parsed_url.scheme == "http" else parsed_url._replace(scheme="http", netloc=(f"{KNOWN_HOSTING_IP}:{parsed_url.port}" if parsed_url.port else KNOWN_HOSTING_IP) if request_host else parsed_url.netloc).geturl()
                 try:
-                    data = _download_with_urllib(insecure_url, use_ssl_context=False)
+                    data = _download_with_urllib(insecure_url, use_ssl_context=False, host_header=request_host)
                 except (URLError, HTTPError) as fallback_exc:
                     raise RuntimeError(
                         f"Failed to download image via requests(verify=False), urllib HTTPS, and HTTP fallback. "
