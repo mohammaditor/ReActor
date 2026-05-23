@@ -52,6 +52,7 @@ CACHE_DIR = REPO_ROOT / "cache"
 SOURCES_CACHE_DIR = CACHE_DIR / "sources"
 TARGETS_CACHE_DIR = CACHE_DIR / "targets"
 RESULTS_CACHE_DIR = CACHE_DIR / "results"
+TMP_CACHE_DIR = CACHE_DIR / "tmp"
 # ===============================================================
 
 SWAP_EXECUTOR = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_REQUESTS)
@@ -63,6 +64,7 @@ def _ensure_cache_dirs() -> None:
     SOURCES_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     TARGETS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     RESULTS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    TMP_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def _sha256_hex(value: str) -> str:
@@ -183,6 +185,45 @@ def _try_decode_base64_image(value: str) -> Image.Image | None:
         return None
 
 
+
+
+def _resolve_tmp_cached_url_image(path_or_url: str) -> Path | None:
+    if not _is_url(path_or_url):
+        return None
+
+    parsed_url = urlparse(path_or_url)
+    raw_path = parsed_url.path
+    if not raw_path:
+        return None
+
+    decoded_path = unquote(raw_path)
+    candidate_paths = [Path(raw_path)]
+    if decoded_path and decoded_path != raw_path:
+        candidate_paths.append(Path(decoded_path))
+
+    checked_rel_paths: list[Path] = []
+    for candidate_path in candidate_paths:
+        file_name = candidate_path.name
+        if not file_name:
+            continue
+
+        rel_file_only = Path(file_name)
+        if rel_file_only not in checked_rel_paths:
+            checked_rel_paths.append(rel_file_only)
+
+        parent_name = candidate_path.parent.name
+        if parent_name:
+            rel_with_parent = Path(parent_name) / file_name
+            if rel_with_parent not in checked_rel_paths:
+                checked_rel_paths.append(rel_with_parent)
+
+    for rel_path in checked_rel_paths:
+        candidate_path = TMP_CACHE_DIR / rel_path
+        if candidate_path.exists() and candidate_path.is_file():
+            return candidate_path
+
+    return None
+
 def _load_image(
     path_or_url: str,
     cache_subdir: Path,
@@ -248,6 +289,29 @@ def _load_image(
             except Exception:
                 pass
         _mark("url_cache_lookup", t_url_lookup)
+
+        t_tmp_lookup = time.perf_counter()
+        tmp_cached_file = _resolve_tmp_cached_url_image(path_or_url)
+        _mark("tmp_lookup", t_tmp_lookup)
+        if tmp_cached_file is not None:
+            t_tmp_open = time.perf_counter()
+            image = Image.open(tmp_cached_file).convert("RGB")
+            _mark("tmp_open", t_tmp_open)
+            t_hash = time.perf_counter()
+            content_hash = _image_sha256_hex(image)
+            _mark("hash", t_hash)
+            cache_file = cache_subdir / f"{content_hash}.png"
+            t_cache_write = time.perf_counter()
+            if not cache_file.exists():
+                image.save(cache_file, format="PNG")
+            _mark("cache_write_if_miss", t_cache_write)
+            t_url_index_write = time.perf_counter()
+            try:
+                url_map_file.write_text(content_hash, encoding="utf-8")
+            except Exception:
+                pass
+            _mark("url_cache_index_write", t_url_index_write)
+            return image, cache_file
 
         t_download = time.perf_counter()
         parsed_url = urlparse(path_or_url)
