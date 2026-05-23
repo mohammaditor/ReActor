@@ -3,3 +3,9 @@ __pycache__/
 .vscode/
 example
 input
+_models/*
+venv/
+venv/*
+cache/*
+dll/*
+socketProxy/node_modules
