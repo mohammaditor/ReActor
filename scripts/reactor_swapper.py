@@ -230,22 +230,25 @@ def swap_face(
     source_img: Union[Image.Image, None],
     target_img: Image.Image,
     model: Union[str, None] = None,
-    source_faces_index: List[int] = [0],
-    faces_index: List[int] = [0],
+    source_faces_index: Union[List[int], None] = None,
+    faces_index: Union[List[int], None] = None,
     gender_source: int = 0,
     gender_target: int = 0,
     face_model: Union[Face, None] = None,
-    faces_order: List = ["large-small", "large-small"],
+    faces_order: Union[List[str], None] = None,
     face_boost_enabled: bool = False,
     face_restore_model = None,
     face_restore_visibility: int = 1,
     codeformer_weight: float = 0.5,
     interpolation: str = "Bicubic",
 ):
-    global SOURCE_FACES, SOURCE_IMAGE_HASH, TARGET_FACES, TARGET_IMAGE_HASH
     result_image = target_img
     bbox = []
     swapped_indexes = []
+
+    source_faces_index = source_faces_index or [0]
+    faces_index = faces_index or [0]
+    faces_order = faces_order or ["large-small", "large-small"]
 
     if model is not None:
 
@@ -268,26 +271,8 @@ def swap_face(
 
             source_img = cv2.cvtColor(np.array(source_img), cv2.COLOR_RGB2BGR)
 
-            source_image_md5hash = get_image_md5hash(source_img)
-
-            if SOURCE_IMAGE_HASH is None:
-                SOURCE_IMAGE_HASH = source_image_md5hash
-                source_image_same = False
-            else:
-                source_image_same = True if SOURCE_IMAGE_HASH == source_image_md5hash else False
-                if not source_image_same:
-                    SOURCE_IMAGE_HASH = source_image_md5hash
-
-            logger.info("Source Image MD5 Hash = %s", SOURCE_IMAGE_HASH)
-            logger.info("Source Image the Same? %s", source_image_same)
-
-            if SOURCE_FACES is None or not source_image_same:
-                logger.status("Analyzing Source Image...")
-                source_faces = analyze_faces(source_img)
-                SOURCE_FACES = source_faces
-            elif source_image_same:
-                logger.status("Using Hashed Source Face(s) Model...")
-                source_faces = SOURCE_FACES
+            logger.status("Analyzing Source Image...")
+            source_faces = analyze_faces(source_img)
 
         elif face_model is not None:
 
@@ -301,26 +286,8 @@ def swap_face(
 
         if source_faces is not None:
 
-            target_image_md5hash = get_image_md5hash(target_img)
-
-            if TARGET_IMAGE_HASH is None:
-                TARGET_IMAGE_HASH = target_image_md5hash
-                target_image_same = False
-            else:
-                target_image_same = True if TARGET_IMAGE_HASH == target_image_md5hash else False
-                if not target_image_same:
-                    TARGET_IMAGE_HASH = target_image_md5hash
-
-            logger.info("Target Image MD5 Hash = %s", TARGET_IMAGE_HASH)
-            logger.info("Target Image the Same? %s", target_image_same)
-            
-            if TARGET_FACES is None or not target_image_same:
-                logger.status("Analyzing Target Image...")
-                target_faces = analyze_faces(target_img)
-                TARGET_FACES = target_faces
-            elif target_image_same:
-                logger.status("Using Hashed Target Face(s) Model...")
-                target_faces = TARGET_FACES
+            logger.status("Analyzing Target Image...")
+            target_faces = analyze_faces(target_img)
 
             if len(target_faces) == 0:
                 logger.status("Cannot detect any Target, skipping swapping...")
@@ -397,22 +364,25 @@ def swap_face_many(
     source_img: Union[Image.Image, None],
     target_imgs: List[Image.Image],
     model: Union[str, None] = None,
-    source_faces_index: List[int] = [0],
-    faces_index: List[int] = [0],
+    source_faces_index: Union[List[int], None] = None,
+    faces_index: Union[List[int], None] = None,
     gender_source: int = 0,
     gender_target: int = 0,
     face_model: Union[Face, None] = None,
-    faces_order: List = ["large-small", "large-small"],
+    faces_order: Union[List[str], None] = None,
     face_boost_enabled: bool = False,
     face_restore_model = None,
     face_restore_visibility: int = 1,
     codeformer_weight: float = 0.5,
     interpolation: str = "Bicubic",
 ):
-    global SOURCE_FACES, SOURCE_IMAGE_HASH, TARGET_FACES, TARGET_IMAGE_HASH, TARGET_FACES_LIST, TARGET_IMAGE_LIST_HASH
     result_images = target_imgs
     bbox = []
     swapped_indexes = []
+
+    source_faces_index = source_faces_index or [0]
+    faces_index = faces_index or [0]
+    faces_order = faces_order or ["large-small", "large-small"]
 
     if model is not None:
         if isinstance(source_img, str): 
@@ -428,26 +398,8 @@ def swap_face_many(
 
         if source_img is not None:
             source_img = cv2.cvtColor(np.array(source_img), cv2.COLOR_RGB2BGR)
-            source_image_md5hash = get_image_md5hash(source_img)
-
-            if SOURCE_IMAGE_HASH is None:
-                SOURCE_IMAGE_HASH = source_image_md5hash
-                source_image_same = False
-            else:
-                source_image_same = True if SOURCE_IMAGE_HASH == source_image_md5hash else False
-                if not source_image_same:
-                    SOURCE_IMAGE_HASH = source_image_md5hash
-
-            logger.info("Source Image MD5 Hash = %s", SOURCE_IMAGE_HASH)
-            logger.info("Source Image the Same? %s", source_image_same)
-
-            if SOURCE_FACES is None or not source_image_same:
-                logger.status("Analyzing Source Image...")
-                source_faces = analyze_faces(source_img)
-                SOURCE_FACES = source_faces
-            elif source_image_same:
-                logger.status("Using Hashed Source Face(s) Model...")
-                source_faces = SOURCE_FACES
+            logger.status("Analyzing Source Image...")
+            source_faces = analyze_faces(source_img)
 
         elif face_model is not None:
             source_faces_index = [0]
@@ -461,42 +413,14 @@ def swap_face_many(
             target_faces = []
             pbar = progress_bar(len(target_imgs))
 
-            if len(TARGET_IMAGE_LIST_HASH) > 0:
-                logger.status(f"Using Hashed Target Face(s) Model...")
-            else:
-                logger.status(f"Analyzing Target Image...")
-            
+            logger.status(f"Analyzing Target Image...")
+
             for i, target_img in enumerate(target_imgs):
                 if state.interrupted or model_management.processing_interrupted():
                     logger.status("Interrupted by User")
                     break
                 
-                target_image_md5hash = get_image_md5hash(target_img)
-                if len(TARGET_IMAGE_LIST_HASH) == 0:
-                    TARGET_IMAGE_LIST_HASH = [target_image_md5hash]
-                    target_image_same = False
-                elif len(TARGET_IMAGE_LIST_HASH) == i:
-                    TARGET_IMAGE_LIST_HASH.append(target_image_md5hash)
-                    target_image_same = False
-                else:
-                    target_image_same = True if TARGET_IMAGE_LIST_HASH[i] == target_image_md5hash else False
-                    if not target_image_same:
-                        TARGET_IMAGE_LIST_HASH[i] = target_image_md5hash
-                
-                logger.info("(Image %s) Target Image MD5 Hash = %s", i, TARGET_IMAGE_LIST_HASH[i])
-                logger.info("(Image %s) Target Image the Same? %s", i, target_image_same)
-
-                if len(TARGET_FACES_LIST) == 0:
-                    target_face = analyze_faces(target_img)
-                    TARGET_FACES_LIST = [target_face]
-                elif len(TARGET_FACES_LIST) == i and not target_image_same:
-                    target_face = analyze_faces(target_img)
-                    TARGET_FACES_LIST.append(target_face)
-                elif len(TARGET_FACES_LIST) != i and not target_image_same:
-                    target_face = analyze_faces(target_img)
-                    TARGET_FACES_LIST[i] = target_face
-                elif target_image_same:
-                    target_face = TARGET_FACES_LIST[i]
+                target_face = analyze_faces(target_img)
                 
                 if target_face is not None:
                     target_faces.append(target_face)
