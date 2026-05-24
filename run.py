@@ -343,48 +343,45 @@ def _load_image(
         if direct_ip_url_info is not None and direct_ip_url_info[0] != path_or_url:
             request_candidates.append((direct_ip_url_info[0], direct_ip_url_info[1]))
 
-        def _download_with_urllib(request_url: str, use_ssl_context: bool, host_header: str | None = None) -> bytes:
+        def _download_with_urllib(request_url: str, host_header: str | None = None) -> bytes:
             req_headers = {"User-Agent": "ReActor-Standalone/1.0"}
             if host_header:
                 req_headers["Host"] = host_header
-            req = Request(request_url, headers=req_headers)
-
-            # Always bypass proxies for maximum speed and to avoid environment issues
-            import urllib.request
-            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-            if use_ssl_context:
-                opener.add_handler(urllib.request.HTTPSHandler(context=SSL_CONTEXT))
             
+            # Always bypass proxies and always use the unverified context
+            # We must pass these to build_opener to properly override the default handlers
+            import urllib.request
+            proxy_handler = urllib.request.ProxyHandler({})
+            https_handler = urllib.request.HTTPSHandler(context=SSL_CONTEXT)
+            opener = urllib.request.build_opener(proxy_handler, https_handler)
+            
+            req = Request(request_url, headers=req_headers)
             with opener.open(req, timeout=60) as response:
                 return response.read()
 
         data: bytes | None = None
         download_errors: list[str] = []
 
-        # Optimized Strategy: Direct IP connection for haani.ir to skip DNS lookup (CURLOPT_RESOLVE style)
-        # and always bypassing proxies.
+        # Prioritize direct IP to skip DNS (CURLOPT_RESOLVE style)
+        request_candidates: list[tuple[str, str | None]] = []
+        direct_ip_url_info = _build_direct_ip_url(path_or_url, KNOWN_HOSTING_IP)
+        if direct_ip_url_info is not None:
+            request_candidates.append((direct_ip_url_info[0], direct_ip_url_info[1]))
+        
+        # Original URL as fallback (though IP should work if server is up)
+        if not request_candidates or request_candidates[0][0] != path_or_url:
+            request_candidates.append((path_or_url, None))
+
         for request_url, request_host in request_candidates:
-            # If we have a direct IP mapping (already handled in request_candidates by _build_direct_ip_url)
-            # or even for the original URL, we enforce proxy bypass.
             try:
-                # Use urllib with ProxyHandler({}) to ensure NO proxy is used
-                # We prioritize HTTPS with the mapped IP and Host header
-                data = _download_with_urllib(request_url, use_ssl_context=True, host_header=request_host)
+                data = _download_with_urllib(request_url, host_header=request_host)
                 break
             except Exception as exc:
-                is_ssl_related = isinstance(exc, ssl.SSLError) or isinstance(getattr(exc, "reason", None), ssl.SSLError)
-                if parsed_url.scheme != "https" or not is_ssl_related:
-                    download_errors.append(f"url={request_url} error={exc}")
-                    continue
+                download_errors.append(f"url={request_url} error={exc}")
                 
-                # If HTTPS fails (e.g. SSL issues even without proxy), fallback to HTTP
-                insecure_url = request_url if parsed_url.scheme == "http" else parsed_url._replace(scheme="http", netloc=(f"{KNOWN_HOSTING_IP}:{parsed_url.port}" if parsed_url.port else KNOWN_HOSTING_IP) if request_host else parsed_url.netloc).geturl()
-                try:
-                    data = _download_with_urllib(insecure_url, use_ssl_context=False, host_header=request_host)
-                    break
-                except Exception as fallback_exc:
-                    download_errors.append(f"url={request_url} https_error={exc} http_fallback_url={insecure_url} fallback_error={fallback_exc}")
-                    continue
+                # If it's a direct IP URL that failed, it might be due to server SSL config
+                # but with unverified context it should be fine. We still try the next candidate.
+                continue
 
         if data is None:
             raise RuntimeError(
