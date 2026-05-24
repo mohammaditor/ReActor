@@ -4,6 +4,7 @@ import os
 import sys
 import threading
 import time
+import logging
 import uuid
 import types
 import ssl
@@ -59,6 +60,14 @@ SWAP_EXECUTOR = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_REQUESTS)
 RESULT_LOCK = threading.Lock()
 SSL_CONTEXT = ssl._create_unverified_context()
 KNOWN_HOSTING_IP = "45.149.77.233"
+
+LOGGER = logging.getLogger("reactor.swap")
+if not LOGGER.handlers:
+    _handler = logging.StreamHandler(sys.stderr)
+    _handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
+    LOGGER.addHandler(_handler)
+LOGGER.setLevel(logging.INFO)
+LOGGER.propagate = False
 
 
 def _ensure_cache_dirs() -> None:
@@ -736,8 +745,24 @@ class SwapHandler(BaseHTTPRequestHandler):
                 self._send_jpeg(body)
             self._log_request_timing(request_start, "processed", request_id, stage_times_ms)
         except Exception as exc:
-            error = str(exc).encode("utf-8", errors="ignore")
             status_code = 502 if isinstance(exc, RuntimeError) and str(exc).startswith("Failed to download image") else 500
+            source_url_values = params.get("source_url", []) if "params" in locals() else []
+            target_url_values = params.get("target_url", []) if "params" in locals() else []
+            error_message = str(exc)
+            LOGGER.exception(
+                "[swap][error] req_id=%s status=%s path=%s source_url_count=%s target_url_count=%s source_url=%s target_url=%s exc_type=%s exc=%s",
+                request_id,
+                status_code,
+                self.path,
+                len(source_url_values),
+                len(target_url_values),
+                source_url_values[0] if source_url_values else None,
+                target_url_values[0] if target_url_values else None,
+                type(exc).__name__,
+                error_message,
+            )
+
+            error = error_message.encode("utf-8", errors="ignore")
             self.send_response(status_code)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
             self.send_header("Content-Length", str(len(error)))
@@ -765,9 +790,9 @@ class SwapHandler(BaseHTTPRequestHandler):
         if stage_times_ms:
             stage_parts = [f"{stage}={duration:.2f}ms" for stage, duration in sorted(stage_times_ms.items())]
             stages_str = " ".join(stage_parts)
-            print(f"[swap] req_id={request_id} outcome={outcome} elapsed_ms={elapsed_ms:.2f} path={self.path} {stages_str}")
+            LOGGER.info("[swap] req_id=%s outcome=%s elapsed_ms=%.2f path=%s %s", request_id, outcome, elapsed_ms, self.path, stages_str)
             return
-        print(f"[swap] req_id={request_id} outcome={outcome} elapsed_ms={elapsed_ms:.2f} path={self.path}")
+        LOGGER.info("[swap] req_id=%s outcome=%s elapsed_ms=%.2f path=%s", request_id, outcome, elapsed_ms, self.path)
 
 
 def main() -> None:

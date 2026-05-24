@@ -1,4 +1,6 @@
 import os
+import sys
+import logging
 import threading
 from http.server import ThreadingHTTPServer
 from typing import Callable, Awaitable
@@ -14,6 +16,14 @@ _INTERNAL_BASE = f"http://{_INTERNAL_HOST}:{_INTERNAL_PORT}"
 _server_started = False
 _server_lock = threading.Lock()
 
+LOGGER = logging.getLogger("reactor.asgi")
+if not LOGGER.handlers:
+    _handler = logging.StreamHandler(sys.stderr)
+    _handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
+    LOGGER.addHandler(_handler)
+LOGGER.setLevel(logging.INFO)
+LOGGER.propagate = False
+
 
 def _ensure_internal_server() -> None:
     global _server_started
@@ -26,6 +36,7 @@ def _ensure_internal_server() -> None:
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         _server_started = True
+        LOGGER.info("Internal swap server started at %s:%s", _INTERNAL_HOST, _INTERNAL_PORT)
 
 
 async def app(scope, receive, send):
@@ -49,7 +60,11 @@ async def app(scope, receive, send):
         target_url = f"{target_url}?{query_string}"
 
     try:
+        LOGGER.info("Proxying request to internal server: path=%s query_length=%s", raw_path, len(query_string))
         resp = requests.get(target_url, timeout=600)
+        LOGGER.info("Internal response status=%s content_type=%s target=%s", resp.status_code, resp.headers.get("Content-Type"), target_url)
+        if resp.status_code >= 500:
+            LOGGER.error("Internal error response status=%s body_preview=%r", resp.status_code, resp.content[:500])
         headers = []
         content_type = resp.headers.get("Content-Type")
         if content_type:
@@ -60,6 +75,7 @@ async def app(scope, receive, send):
         await send({"type": "http.response.start", "status": resp.status_code, "headers": headers})
         await send({"type": "http.response.body", "body": resp.content})
     except Exception as exc:
+        LOGGER.exception("ASGI proxy failure for target_url=%s", target_url)
         msg = str(exc).encode("utf-8", errors="ignore")
         await send({"type": "http.response.start", "status": 500, "headers": [[b"content-type", b"text/plain; charset=utf-8"]]})
         await send({"type": "http.response.body", "body": msg})
