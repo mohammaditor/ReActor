@@ -1,4 +1,5 @@
 import os
+import sys
 import logging
 import threading
 from http.server import ThreadingHTTPServer
@@ -16,6 +17,12 @@ _server_started = False
 _server_lock = threading.Lock()
 
 LOGGER = logging.getLogger("reactor.asgi")
+if not LOGGER.handlers:
+    _handler = logging.StreamHandler(sys.stderr)
+    _handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
+    LOGGER.addHandler(_handler)
+LOGGER.setLevel(logging.INFO)
+LOGGER.propagate = False
 
 
 def _ensure_internal_server() -> None:
@@ -55,6 +62,9 @@ async def app(scope, receive, send):
     try:
         LOGGER.info("Proxying request to internal server: path=%s query_length=%s", raw_path, len(query_string))
         resp = requests.get(target_url, timeout=600)
+        LOGGER.info("Internal response status=%s content_type=%s target=%s", resp.status_code, resp.headers.get("Content-Type"), target_url)
+        if resp.status_code >= 500:
+            LOGGER.error("Internal error response status=%s body_preview=%r", resp.status_code, resp.content[:500])
         headers = []
         content_type = resp.headers.get("Content-Type")
         if content_type:
