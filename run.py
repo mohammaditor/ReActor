@@ -61,13 +61,13 @@ RESULT_LOCK = threading.Lock()
 SSL_CONTEXT = ssl._create_unverified_context()
 KNOWN_HOSTING_IP = "45.149.77.233"
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-    stream=sys.stderr,
-    force=True,
-)
 LOGGER = logging.getLogger("reactor.swap")
+if not LOGGER.handlers:
+    _handler = logging.StreamHandler(sys.stderr)
+    _handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
+    LOGGER.addHandler(_handler)
+LOGGER.setLevel(logging.INFO)
+LOGGER.propagate = False
 
 
 def _ensure_cache_dirs() -> None:
