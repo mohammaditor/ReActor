@@ -4,6 +4,7 @@ import os
 import sys
 import threading
 import time
+import traceback
 import uuid
 import types
 import ssl
@@ -736,8 +737,25 @@ class SwapHandler(BaseHTTPRequestHandler):
                 self._send_jpeg(body)
             self._log_request_timing(request_start, "processed", request_id, stage_times_ms)
         except Exception as exc:
-            error = str(exc).encode("utf-8", errors="ignore")
             status_code = 502 if isinstance(exc, RuntimeError) and str(exc).startswith("Failed to download image") else 500
+            source_url_values = params.get("source_url", []) if "params" in locals() else []
+            target_url_values = params.get("target_url", []) if "params" in locals() else []
+            error_message = str(exc)
+            print(
+                "[swap][error] "
+                f"req_id={request_id} "
+                f"status={status_code} "
+                f"path={self.path} "
+                f"source_url_count={len(source_url_values)} "
+                f"target_url_count={len(target_url_values)} "
+                f"source_url={source_url_values[0] if source_url_values else None} "
+                f"target_url={target_url_values[0] if target_url_values else None} "
+                f"exc_type={type(exc).__name__} "
+                f"exc={error_message}"
+            )
+            print("[swap][error][traceback]\n" + traceback.format_exc())
+
+            error = error_message.encode("utf-8", errors="ignore")
             self.send_response(status_code)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
             self.send_header("Content-Length", str(len(error)))
