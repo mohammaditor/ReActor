@@ -4,7 +4,7 @@ import os
 import sys
 import threading
 import time
-import traceback
+import logging
 import uuid
 import types
 import ssl
@@ -60,6 +60,14 @@ SWAP_EXECUTOR = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_REQUESTS)
 RESULT_LOCK = threading.Lock()
 SSL_CONTEXT = ssl._create_unverified_context()
 KNOWN_HOSTING_IP = "45.149.77.233"
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    stream=sys.stderr,
+    force=True,
+)
+LOGGER = logging.getLogger("reactor.swap")
 
 
 def _ensure_cache_dirs() -> None:
@@ -741,19 +749,18 @@ class SwapHandler(BaseHTTPRequestHandler):
             source_url_values = params.get("source_url", []) if "params" in locals() else []
             target_url_values = params.get("target_url", []) if "params" in locals() else []
             error_message = str(exc)
-            print(
-                "[swap][error] "
-                f"req_id={request_id} "
-                f"status={status_code} "
-                f"path={self.path} "
-                f"source_url_count={len(source_url_values)} "
-                f"target_url_count={len(target_url_values)} "
-                f"source_url={source_url_values[0] if source_url_values else None} "
-                f"target_url={target_url_values[0] if target_url_values else None} "
-                f"exc_type={type(exc).__name__} "
-                f"exc={error_message}"
+            LOGGER.exception(
+                "[swap][error] req_id=%s status=%s path=%s source_url_count=%s target_url_count=%s source_url=%s target_url=%s exc_type=%s exc=%s",
+                request_id,
+                status_code,
+                self.path,
+                len(source_url_values),
+                len(target_url_values),
+                source_url_values[0] if source_url_values else None,
+                target_url_values[0] if target_url_values else None,
+                type(exc).__name__,
+                error_message,
             )
-            print("[swap][error][traceback]\n" + traceback.format_exc())
 
             error = error_message.encode("utf-8", errors="ignore")
             self.send_response(status_code)
@@ -783,9 +790,9 @@ class SwapHandler(BaseHTTPRequestHandler):
         if stage_times_ms:
             stage_parts = [f"{stage}={duration:.2f}ms" for stage, duration in sorted(stage_times_ms.items())]
             stages_str = " ".join(stage_parts)
-            print(f"[swap] req_id={request_id} outcome={outcome} elapsed_ms={elapsed_ms:.2f} path={self.path} {stages_str}")
+            LOGGER.info("[swap] req_id=%s outcome=%s elapsed_ms=%.2f path=%s %s", request_id, outcome, elapsed_ms, self.path, stages_str)
             return
-        print(f"[swap] req_id={request_id} outcome={outcome} elapsed_ms={elapsed_ms:.2f} path={self.path}")
+        LOGGER.info("[swap] req_id=%s outcome=%s elapsed_ms=%.2f path=%s", request_id, outcome, elapsed_ms, self.path)
 
 
 def main() -> None:
