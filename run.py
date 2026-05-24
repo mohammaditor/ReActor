@@ -339,8 +339,9 @@ def _load_image(
         parsed_url = urlparse(path_or_url)
 
         direct_ip_url_info = _build_direct_ip_url(path_or_url, KNOWN_HOSTING_IP)
-        request_url = direct_ip_url_info[0] if direct_ip_url_info is not None else path_or_url
-        request_host = direct_ip_url_info[1] if direct_ip_url_info is not None else None
+        request_candidates: list[tuple[str, str | None]] = [(path_or_url, None)]
+        if direct_ip_url_info is not None and direct_ip_url_info[0] != path_or_url:
+            request_candidates.append((direct_ip_url_info[0], direct_ip_url_info[1]))
 
         def _download_with_urllib(request_url: str, use_ssl_context: bool, host_header: str | None = None) -> bytes:
             req_headers = {"User-Agent": "ReActor-Standalone/1.0"}
@@ -353,36 +354,51 @@ def _load_image(
             with urlopen(req, timeout=60) as response:
                 return response.read()
 
-        try:
-            request_headers = {"User-Agent": "ReActor-Standalone/1.0"}
-            if request_host:
-                request_headers["Host"] = request_host
-
-            response = requests.get(
-                request_url,
-                timeout=60,
-                verify=False,
-                headers=request_headers,
-                allow_redirects=True,
-            )
-            response.raise_for_status()
-            data = response.content
-        except requests.exceptions.RequestException as req_exc:
-            # Fallback to urllib path in case requests fails due to environment quirks.
+        data: bytes | None = None
+        download_errors: list[str] = []
+        for request_url, request_host in request_candidates:
             try:
-                data = _download_with_urllib(request_url, use_ssl_context=True, host_header=request_host)
-            except (ssl.SSLError, URLError) as exc:
-                is_ssl_related = isinstance(exc, ssl.SSLError) or isinstance(getattr(exc, "reason", None), ssl.SSLError)
-                if parsed_url.scheme != "https" or not is_ssl_related:
-                    raise RuntimeError(f"Failed to download image: {req_exc}") from req_exc
-                insecure_url = request_url if parsed_url.scheme == "http" else parsed_url._replace(scheme="http", netloc=(f"{KNOWN_HOSTING_IP}:{parsed_url.port}" if parsed_url.port else KNOWN_HOSTING_IP) if request_host else parsed_url.netloc).geturl()
+                request_headers = {"User-Agent": "ReActor-Standalone/1.0"}
+                if request_host:
+                    request_headers["Host"] = request_host
+
+                response = requests.get(
+                    request_url,
+                    timeout=60,
+                    verify=False,
+                    headers=request_headers,
+                    allow_redirects=True,
+                )
+                response.raise_for_status()
+                data = response.content
+                break
+            except requests.exceptions.RequestException as req_exc:
+                # Fallback to urllib path in case requests fails due to environment quirks.
                 try:
-                    data = _download_with_urllib(insecure_url, use_ssl_context=False, host_header=request_host)
-                except (URLError, HTTPError) as fallback_exc:
-                    raise RuntimeError(
-                        f"Failed to download image via requests(verify=False), urllib HTTPS, and HTTP fallback. "
-                        f"https_url={path_or_url} http_url={insecure_url} fallback_error={fallback_exc}"
-                    ) from fallback_exc
+                    data = _download_with_urllib(request_url, use_ssl_context=True, host_header=request_host)
+                    break
+                except (ssl.SSLError, URLError) as exc:
+                    is_ssl_related = isinstance(exc, ssl.SSLError) or isinstance(getattr(exc, "reason", None), ssl.SSLError)
+                    if parsed_url.scheme != "https" or not is_ssl_related:
+                        download_errors.append(f"url={request_url} requests_error={req_exc} urllib_error={exc}")
+                        continue
+                    insecure_url = request_url if parsed_url.scheme == "http" else parsed_url._replace(scheme="http", netloc=(f"{KNOWN_HOSTING_IP}:{parsed_url.port}" if parsed_url.port else KNOWN_HOSTING_IP) if request_host else parsed_url.netloc).geturl()
+                    try:
+                        data = _download_with_urllib(insecure_url, use_ssl_context=False, host_header=request_host)
+                        break
+                    except (URLError, HTTPError) as fallback_exc:
+                        download_errors.append(
+                            "url="
+                            f"{request_url} requests_error={req_exc} urllib_error={exc} "
+                            f"http_fallback_url={insecure_url} fallback_error={fallback_exc}"
+                        )
+                        continue
+
+        if data is None:
+            raise RuntimeError(
+                "Failed to download image after trying all strategies. "
+                f"original_url={path_or_url} attempts={'; '.join(download_errors)}"
+            )
         _mark("download", t_download)
 
         t_decode = time.perf_counter()
