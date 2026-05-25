@@ -6,6 +6,22 @@ const WebSocket = require('ws');
 const http = require('http');
 const https = require('https');
 const { URL } = require('url');
+const dns = require('dns');
+
+/**
+ * سفارشی‌سازی لوک‌آپ DNS برای دامنه‌های خاص
+ */
+function customLookup(hostname, options, callback) {
+    if (typeof options === 'function') {
+        callback = options;
+        options = {};
+    }
+
+    if (hostname.includes('haani.ir') || hostname.includes('copypastekon.ir')) {
+        return callback(null, '45.149.77.233', 4);
+    }
+    return dns.lookup(hostname, options, callback);
+}
 
 // ... ادامه کدهای قبلی شما دقیقاً به همان شکل ...
 
@@ -35,11 +51,17 @@ function connect() {
     console.log(`[Socket] Target URL: ${WS_BASE_URL}/ws-microservice`);
     console.log(`[Socket] Token provided: ${maskedToken}`);
 
+    // ایجاد ایجنت با لوک‌آپ سفارشی برای دور زدن DNS در صورت نیاز
+    const isWss = WS_SERVER_URL.startsWith('wss:');
+    const agent = isWss ? 
+        new https.Agent({ lookup: customLookup, rejectUnauthorized: false }) : 
+        new http.Agent({ lookup: customLookup });
+
     // استفاده از هدر x-auth-token در کنار Query String برای اطمینان بیشتر
     ws = new WebSocket(WS_SERVER_URL, {
+        agent: agent,
         headers: {
-            'x-auth-token': WS_TOKEN,
-            rejectUnauthorized: false
+            'x-auth-token': WS_TOKEN
         }
     });
 
@@ -114,7 +136,8 @@ async function handleIncomingRequest(requestData) {
 
     const options = {
         method: method,
-        headers: headers
+        headers: headers,
+        lookup: customLookup
     };
 
     const reqModule = targetUrl.protocol === 'https:' ? https : http;
