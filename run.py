@@ -353,12 +353,14 @@ def _load_image(
             if host_header:
                 req_headers["Host"] = host_header
             
-            # Always bypass proxies and always use the unverified context
-            # We must pass these to build_opener to properly override the default handlers
+            # Use system proxies for normal requests, bypass only for direct IP hits
             import urllib.request
-            proxy_handler = urllib.request.ProxyHandler({})
-            https_handler = urllib.request.HTTPSHandler(context=SSL_CONTEXT)
-            opener = urllib.request.build_opener(proxy_handler, https_handler)
+            handlers = [urllib.request.HTTPSHandler(context=SSL_CONTEXT)]
+            if host_header:
+                # Force bypass proxies when hitting a direct IP to avoid routing issues
+                handlers.append(urllib.request.ProxyHandler({}))
+            
+            opener = urllib.request.build_opener(*handlers)
             
             req = Request(request_url, headers=req_headers)
             with opener.open(req, timeout=60) as response:
