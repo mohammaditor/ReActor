@@ -206,6 +206,11 @@ def _build_direct_ip_url(path_or_url: str, direct_ip: str) -> tuple[str, str] | 
     if not parsed.hostname:
         return None
 
+    # فقط برای دامنه های مشخص شده از آی پی مستقیم استفاده شود
+    target_domains = ['haani.ir', 'copypastekon.ir']
+    if not any(domain in parsed.hostname for domain in target_domains):
+        return None
+
     direct_url = parsed._replace(netloc=f"{direct_ip}:{parsed.port}" if parsed.port else direct_ip).geturl()
     return direct_url, parsed.hostname
 
