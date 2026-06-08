@@ -482,23 +482,28 @@ def _get_video_fps(video_path: Path) -> float:
         return 30.0
 
 
-def _extract_frames(video_path: Path, output_dir: Path, max_frames: int | None = None) -> int:
+def _extract_frames(video_path: Path, output_dir: Path, fps: float | None = None, limit: int | None = None) -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
-    # Check if frames already exist
+    # Check if frames already exist (we cache by hash of params anyway, but this is a double check)
+    # Actually, with different FPS/limit, we should probably not rely on simple glob if we want to be perfect,
+    # but the cache_key in process_swap_request handles this.
     existing_frames = sorted(output_dir.glob("frame_*.jpg"))
     if existing_frames:
-        if max_frames is None or len(existing_frames) >= max_frames:
+        if limit is None or len(existing_frames) >= limit:
             return len(existing_frames)
 
     cmd = [
         "ffmpeg",
         "-y",
         "-i", str(video_path),
-        "-vsync", "0",
-        "-q:v", "2", # High quality JPEG
     ]
-    if max_frames is not None:
-        cmd.extend(["-vframes", str(max_frames)])
+    if fps is not None:
+        cmd.extend(["-r", str(fps)])
+    
+    cmd.extend(["-vsync", "0", "-q:v", "2"])
+    
+    if limit is not None:
+        cmd.extend(["-vframes", str(limit)])
     
     cmd.append(str(output_dir / "frame_%05d.jpg"))
     
@@ -768,8 +773,11 @@ def process_swap_request(path: str, query_params: dict[str, list[str]], request_
             
             # Cache key for the whole video result
             source_hash = _image_sha256_hex(source_img)
+            limit_param = query_params.get("limit", [None])[0]
+            max_limit = int(limit_param) if limit_param and limit_param.isdigit() else None
+            
             cache_key = _sha256_hex(
-                f"source={source_hash}|target_id={target_id}|opts={repr(sorted(swap_options.items()))}|model=default|frames={max_frames}"
+                f"source={source_hash}|target_id={target_id}|opts={repr(sorted(swap_options.items()))}|model=default|fps={requested_fps}|limit={max_limit}"
             )
             result_video_path = VIDEOS_RESULTS_DIR / f"{cache_key}.mp4"
             
@@ -781,8 +789,8 @@ def process_swap_request(path: str, query_params: dict[str, list[str]], request_
                     return 200, {"Content-Type": "video/mp4"}, body
 
             # Extraction
-            frames_in_dir = video_cache_dir / "frames_in"
-            _extract_frames(video_path, frames_in_dir, max_frames)
+            frames_in_dir = video_cache_dir / f"frames_in_fps{requested_fps or 'orig'}_limit{max_limit or 'none'}"
+            _extract_frames(video_path, frames_in_dir, fps=requested_fps, limit=max_limit)
             
             # Processing
             frames_out_dir = video_cache_dir / f"frames_out_{cache_key}"
