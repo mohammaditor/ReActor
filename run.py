@@ -498,9 +498,11 @@ def _extract_frames(video_path: Path, output_dir: Path, fps: float | None = None
         "-i", str(video_path),
     ]
     if fps is not None:
-        cmd.extend(["-r", str(fps)])
+        cmd.extend(["-r", str(fps), "-fps_mode", "cfr"])
+    else:
+        cmd.extend(["-fps_mode", "passthrough"])
     
-    cmd.extend(["-vsync", "0", "-q:v", "2"])
+    cmd.extend(["-q:v", "2"])
     
     if limit is not None:
         cmd.extend(["-vframes", str(limit)])
