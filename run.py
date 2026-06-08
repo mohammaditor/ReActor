@@ -485,7 +485,7 @@ def _get_video_fps(video_path: Path) -> float:
 def _extract_frames(video_path: Path, output_dir: Path, max_frames: int | None = None) -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
     # Check if frames already exist
-    existing_frames = sorted(output_dir.glob("frame_*.png"))
+    existing_frames = sorted(output_dir.glob("frame_*.jpg"))
     if existing_frames:
         if max_frames is None or len(existing_frames) >= max_frames:
             return len(existing_frames)
@@ -495,15 +495,16 @@ def _extract_frames(video_path: Path, output_dir: Path, max_frames: int | None =
         "-y",
         "-i", str(video_path),
         "-vsync", "0",
+        "-q:v", "2", # High quality JPEG
     ]
     if max_frames is not None:
         cmd.extend(["-vframes", str(max_frames)])
     
-    cmd.append(str(output_dir / "frame_%05d.png"))
+    cmd.append(str(output_dir / "frame_%05d.jpg"))
     
     try:
         subprocess.check_output(cmd, stderr=subprocess.STDOUT)
-        extracted = list(output_dir.glob("frame_*.png"))
+        extracted = list(output_dir.glob("frame_*.jpg"))
         if not extracted:
              raise RuntimeError("ffmpeg finished but no frames were extracted")
         return len(extracted)
@@ -516,8 +517,8 @@ def _extract_frames(video_path: Path, output_dir: Path, max_frames: int | None =
 def _assemble_video(frames_dir: Path, output_path: Path, fps: float, original_video: Path | None = None) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     
-    input_pattern = frames_dir / "frame_%05d.png"
-    if not any(frames_dir.glob("frame_*.png")):
+    input_pattern = frames_dir / "frame_%05d.jpg"
+    if not any(frames_dir.glob("frame_*.jpg")):
         raise RuntimeError(f"No frames found in {frames_dir} to assemble video")
 
     # Simple assembly without audio for now to keep it robust
