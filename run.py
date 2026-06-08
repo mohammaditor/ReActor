@@ -57,6 +57,7 @@ CACHE_DIR = REPO_ROOT / "cache"
 SOURCES_CACHE_DIR = CACHE_DIR / "sources"
 TARGETS_CACHE_DIR = CACHE_DIR / "targets"
 RESULTS_CACHE_DIR = CACHE_DIR / "results"
+FACES_CACHE_DIR = CACHE_DIR / "faces"
 TMP_CACHE_DIR = CACHE_DIR / "tmp"
 VIDEOS_CACHE_DIR = CACHE_DIR / "videos"
 VIDEOS_RESULTS_DIR = VIDEOS_CACHE_DIR / "results"
@@ -80,6 +81,7 @@ def _ensure_cache_dirs() -> None:
     SOURCES_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     TARGETS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     RESULTS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    FACES_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     TMP_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     VIDEOS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     VIDEOS_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -789,17 +791,17 @@ class SwapHandler(BaseHTTPRequestHandler):
                     try:
                         if DISTRIBUTED_VIDEO_PROCESSING:
                             # Build query params for internal request
-                            # Source image is already in SOURCES_CACHE_DIR, we pass its local path
-                            _, source_cache_file = _load_image(source_url, SOURCES_CACHE_DIR)
-                            
-                            query_params = {
-                                "source_url": str(source_cache_file.absolute()),
-                                "target_url": str(frame_path.absolute()),
-                            }
-                            # Add other swap options
-                            for key, val in params.items():
+                            query_params = {}
+                            # Add all original parameters first
+                            for key, vals in params.items():
                                 if key not in ["source_url", "target_url", "frames"]:
-                                    query_params[key] = val[0]
+                                    # Propagate all values if multiple exist
+                                    query_params[key] = ",".join(vals)
+                            
+                            # Override with local paths for the specific frame
+                            _, source_cache_file = _load_image(source_url, SOURCES_CACHE_DIR)
+                            query_params["source_url"] = str(source_cache_file.absolute())
+                            query_params["target_url"] = str(frame_path.absolute())
                             
                             resp = requests.get(internal_base_url, params=query_params, timeout=60)
                             if resp.status_code == 200:
