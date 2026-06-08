@@ -772,19 +772,25 @@ class SwapHandler(BaseHTTPRequestHandler):
                 if max_frames:
                     input_frames = input_frames[:max_frames]
                 
-                for frame_path in input_frames:
+                def _process_frame(frame_path: Path):
                     out_frame_path = frames_out_dir / frame_path.name
                     if out_frame_path.exists():
-                        continue
+                        return
                     
-                    frame_img = Image.open(frame_path).convert("RGB")
-                    swapped_img, _, _ = swap_face(
-                        source_img=source_img,
-                        target_img=frame_img,
-                        model=self.model_path,
-                        **swap_options,
-                    )
-                    swapped_img.save(out_frame_path, format="PNG")
+                    try:
+                        frame_img = Image.open(frame_path).convert("RGB")
+                        swapped_img, _, _ = swap_face(
+                            source_img=source_img,
+                            target_img=frame_img,
+                            model=self.model_path,
+                            **swap_options,
+                        )
+                        swapped_img.save(out_frame_path, format="PNG")
+                    except Exception as e:
+                        LOGGER.error("Error processing frame %s: %s", frame_path, e)
+
+                # Process frames in parallel
+                list(SWAP_EXECUTOR.map(_process_frame, input_frames))
                 
                 # Assembly
                 fps = _get_video_fps(video_path)

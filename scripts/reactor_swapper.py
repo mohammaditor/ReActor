@@ -268,11 +268,20 @@ def swap_face(
         target_img = cv2.cvtColor(np.array(target_img), cv2.COLOR_RGB2BGR)
 
         if source_img is not None:
-
+            # Check if source_img is same as last time to avoid redundant analysis
+            global SOURCE_IMAGE_HASH, SOURCE_FACES
+            current_hash = get_image_md5hash(source_img)
+            
             source_img = cv2.cvtColor(np.array(source_img), cv2.COLOR_RGB2BGR)
 
-            logger.status("Analyzing Source Image...")
-            source_faces = analyze_faces(source_img)
+            if SOURCE_IMAGE_HASH != current_hash:
+                logger.status("Analyzing Source Image...")
+                SOURCE_FACES = analyze_faces(source_img)
+                SOURCE_IMAGE_HASH = current_hash
+            else:
+                logger.status("Using Cached Source Faces...")
+            
+            source_faces = SOURCE_FACES
 
         elif face_model is not None:
 
