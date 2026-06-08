@@ -868,8 +868,8 @@ def process_swap_request(path: str, query_params: dict[str, list[str]], request_
             list(SWAP_EXECUTOR.map(_process_frame, input_frames))
             
             # Assembly
-            fps = _get_video_fps(video_path)
-            _assemble_video(frames_out_dir, result_video_path, fps)
+            fps = requested_fps or _get_video_fps(video_path)
+            _assemble_video(frames_out_dir, result_video_path, fps, original_video=video_path)
             
             body = result_video_path.read_bytes()
             mark("video_processed", t_video)
