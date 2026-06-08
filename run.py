@@ -781,7 +781,7 @@ def process_swap_request(path: str, query_params: dict[str, list[str]], request_
                 shutil.rmtree(frames_out_dir)
             frames_out_dir.mkdir(parents=True, exist_ok=True)
             
-            input_frames = sorted(frames_in_dir.glob("frame_*.png"))
+            input_frames = sorted(frames_in_dir.glob("frame_*.jpg"))
             if max_frames:
                 input_frames = input_frames[:max_frames]
             
@@ -802,8 +802,8 @@ def process_swap_request(path: str, query_params: dict[str, list[str]], request_
                             if key not in ["source_url", "target_url", "frames", "format"]:
                                 sub_query_params[key] = ",".join(vals)
                         
-                        # Request PNG to match our filename and preserve quality
-                        sub_query_params["format"] = "PNG"
+                        # Request JPEG to match our filename and preserve efficiency
+                        sub_query_params["format"] = "JPEG"
                         sub_query_params["is_subrequest"] = "1"
                         
                         _, source_cache_file = _load_image(source_url, SOURCES_CACHE_DIR)
@@ -812,12 +812,12 @@ def process_swap_request(path: str, query_params: dict[str, list[str]], request_
                         
                         resp = requests.get(internal_base_url, params=sub_query_params, timeout=60)
                         if resp.status_code == 200:
-                            # Verify PNG magic number
-                            if resp.content.startswith(b"\x89PNG\r\n\x1a\n"):
+                            # Verify JPEG magic number (0xFF 0xD8)
+                            if resp.content.startswith(b"\xff\xd8"):
                                 with open(out_frame_path, "wb") as f:
                                     f.write(resp.content)
                             else:
-                                LOGGER.error("Received non-PNG content for frame %s (starts with: %s)", frame_path, resp.content[:8].hex())
+                                LOGGER.error("Received non-JPEG content for frame %s (starts with: %s)", frame_path, resp.content[:8].hex())
                         else:
                             LOGGER.error("Distributed processing failed for frame %s: %s", frame_path, resp.text)
                     else:
@@ -828,7 +828,7 @@ def process_swap_request(path: str, query_params: dict[str, list[str]], request_
                             model=_pick_swap_model(),
                             **swap_options,
                         )
-                        swapped_img.save(out_frame_path, format="PNG")
+                        swapped_img.save(out_frame_path, format="JPEG", quality=95)
                 except Exception as e:
                     LOGGER.error("Error processing frame %s: %s", frame_path, e)
 
