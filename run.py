@@ -176,6 +176,8 @@ _validate_model_paths()
 _ensure_cache_dirs()
 _install_comfy_stubs()
 
+from scripts import reactor_swapper  # noqa: E402
+reactor_swapper.FACES_CACHE_DIR = str(FACES_CACHE_DIR.resolve())
 from scripts.reactor_swapper import analyze_faces, swap_face  # noqa: E402
 
 
@@ -679,351 +681,292 @@ def _build_swap_options(params: dict[str, list[str]]) -> dict:
     }
 
 
-class SwapHandler(BaseHTTPRequestHandler):
-    model_path = _pick_swap_model()
+def process_swap_request(path: str, query_params: dict[str, list[str]], request_id: str) -> tuple[int, dict[str, str], bytes]:
+    """
+    Core logic to handle a swap request (image or video).
+    Returns (status_code, headers, body_bytes).
+    """
+    stage_times_ms: dict[str, float] = {}
 
-    def end_headers(self) -> None:
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "*")
-        super().end_headers()
+    def mark(stage_name: str, stage_start: float) -> None:
+        stage_times_ms[stage_name] = (time.perf_counter() - stage_start) * 1000
 
-    def do_OPTIONS(self):
-        self.send_response(204)
-        self.send_header("Content-Length", "0")
-        self.end_headers()
+    if path not in {"/swap", "/swap_face_square"}:
+        return 404, {}, b"Use /swap or /swap_face_square"
 
-    def do_GET(self):
-        request_start = time.perf_counter()
-        request_id = uuid.uuid4().hex[:8]
-        stage_times_ms: dict[str, float] = {}
+    only_face_square = path == "/swap_face_square"
+    source_url = query_params.get("source_url", [None])[0]
+    target_url = query_params.get("target_url", [None])[0]
+    frames_param = query_params.get("frames", [None])[0]
+    max_frames = int(frames_param) if frames_param and frames_param.isdigit() else None
+    
+    if not source_url or not target_url:
+        return 400, {}, b"source_url and target_url are required"
 
-        def mark(stage_name: str, stage_start: float) -> None:
-            stage_times_ms[stage_name] = (time.perf_counter() - stage_start) * 1000
+    try:
+        t_stage = time.perf_counter()
+        swap_options = _build_swap_options(query_params)
+        mark("parse_options", t_stage)
 
-        parsed = urlparse(self.path)
-        if parsed.path not in {"/swap", "/swap_face_square"}:
-            self.send_error(404, "Use /swap or /swap_face_square")
-            self._log_request_timing(request_start, "invalid_path", request_id, stage_times_ms)
-            return
+        t_stage = time.perf_counter()
+        source_img, _ = _load_image(
+            source_url,
+            SOURCES_CACHE_DIR,
+            timing_prefix="source_load",
+            timings_out=stage_times_ms,
+        )
+        mark("load_source", t_stage)
 
-        params = parse_qs(parsed.query)
-        only_face_square = parsed.path == "/swap_face_square"
-        source_url = params.get("source_url", [None])[0]
-        target_url = params.get("target_url", [None])[0]
-        frames_param = params.get("frames", [None])[0]
-        max_frames = int(frames_param) if frames_param and frames_param.isdigit() else None
-        
-        if not source_url or not target_url:
-            self.send_error(400, "source_url and target_url are required")
-            self._log_request_timing(request_start, "missing_required_params", request_id, stage_times_ms)
-            return
+        if _is_video(target_url):
+            t_video = time.perf_counter()
+            target_id = _sha256_hex(target_url)
+            video_cache_dir = VIDEOS_CACHE_DIR / target_id
+            video_cache_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Download or resolve local video
+            if _is_url(target_url):
+                video_path = video_cache_dir / "input_video.mp4"
+                _download_video(target_url, video_path)
+            else:
+                video_path = Path(unquote(target_url))
+                if not video_path.is_absolute():
+                    video_path = Path.cwd() / video_path
+            
+            if not video_path.exists():
+                raise FileNotFoundError(f"Video not found: {video_path}")
+            
+            # Cache key for the whole video result
+            source_hash = _image_sha256_hex(source_img)
+            cache_key = _sha256_hex(
+                f"source={source_hash}|target_id={target_id}|opts={repr(sorted(swap_options.items()))}|model=default|frames={max_frames}"
+            )
+            result_video_path = VIDEOS_RESULTS_DIR / f"{cache_key}.mp4"
+            
+            with RESULT_LOCK:
+                if result_video_path.exists():
+                    body = result_video_path.read_bytes()
+                    mark("video_cache_hit", t_video)
+                    _log_timing(request_id, path, (time.perf_counter() - t_video), "video_cache_hit", stage_times_ms)
+                    return 200, {"Content-Type": "video/mp4"}, body
 
-        try:
+            # Extraction
+            frames_in_dir = video_cache_dir / "frames_in"
+            _extract_frames(video_path, frames_in_dir, max_frames)
+            
+            # Processing
+            frames_out_dir = video_cache_dir / f"frames_out_{cache_key}"
+            frames_out_dir.mkdir(parents=True, exist_ok=True)
+            
+            input_frames = sorted(frames_in_dir.glob("frame_*.png"))
+            if max_frames:
+                input_frames = input_frames[:max_frames]
+            
+            # Determine the base URL for internal requests (Uvicorn port)
+            internal_port = int(os.environ.get("REACTOR_PORT", "8008"))
+            internal_base_url = f"http://127.0.0.1:{internal_port}/swap"
+
+            def _process_frame(frame_path: Path):
+                out_frame_path = frames_out_dir / frame_path.name
+                if out_frame_path.exists():
+                    return
+                
+                try:
+                    if DISTRIBUTED_VIDEO_PROCESSING:
+                        # Build query params for internal request
+                        sub_query_params = {}
+                        for key, vals in query_params.items():
+                            if key not in ["source_url", "target_url", "frames"]:
+                                sub_query_params[key] = ",".join(vals)
+                        
+                        # Add a flag to identify sub-requests if needed
+                        sub_query_params["is_subrequest"] = "1"
+                        
+                        _, source_cache_file = _load_image(source_url, SOURCES_CACHE_DIR)
+                        sub_query_params["source_url"] = str(source_cache_file.absolute())
+                        sub_query_params["target_url"] = str(frame_path.absolute())
+                        
+                        resp = requests.get(internal_base_url, params=sub_query_params, timeout=60)
+                        if resp.status_code == 200:
+                            with open(out_frame_path, "wb") as f:
+                                f.write(resp.content)
+                        else:
+                            LOGGER.error("Distributed processing failed for frame %s: %s", frame_path, resp.text)
+                    else:
+                        frame_img = Image.open(frame_path).convert("RGB")
+                        swapped_img, _, _ = swap_face(
+                            source_img=source_img,
+                            target_img=frame_img,
+                            model=_pick_swap_model(),
+                            **swap_options,
+                        )
+                        swapped_img.save(out_frame_path, format="PNG")
+                except Exception as e:
+                    LOGGER.error("Error processing frame %s: %s", frame_path, e)
+
+            # Process frames in parallel
+            list(SWAP_EXECUTOR.map(_process_frame, input_frames))
+            
+            # Assembly
+            fps = _get_video_fps(video_path)
+            _assemble_video(frames_out_dir, result_video_path, fps)
+            
+            body = result_video_path.read_bytes()
+            mark("video_processed", t_video)
+            _log_timing(request_id, path, (time.perf_counter() - t_video), "video_processed", stage_times_ms)
+            return 200, {"Content-Type": "video/mp4"}, body
+
+        else:
             t_stage = time.perf_counter()
-            swap_options = _build_swap_options(params)
-            mark("parse_options", t_stage)
-
-            t_stage = time.perf_counter()
-            source_img, _ = _load_image(
-                source_url,
-                SOURCES_CACHE_DIR,
-                timing_prefix="source_load",
+            target_img, target_cache_file = _load_image(
+                target_url,
+                TARGETS_CACHE_DIR,
+                timing_prefix="target_load",
                 timings_out=stage_times_ms,
             )
-            mark("load_source", t_stage)
+            mark("load_target", t_stage)
 
-            if _is_video(target_url):
-                t_video = time.perf_counter()
-                target_id = _sha256_hex(target_url)
-                video_cache_dir = VIDEOS_CACHE_DIR / target_id
-                video_cache_dir.mkdir(parents=True, exist_ok=True)
-                
-                # Download or resolve local video
-                if _is_url(target_url):
-                    video_path = video_cache_dir / "input_video.mp4"
-                    _download_video(target_url, video_path)
-                else:
-                    video_path = Path(unquote(target_url))
-                    if not video_path.is_absolute():
-                        video_path = Path.cwd() / video_path
-                
-                if not video_path.exists():
-                    raise FileNotFoundError(f"Video not found: {video_path}")
-                
-                # Cache key for the whole video result
-                source_hash = _image_sha256_hex(source_img)
-                cache_key = _sha256_hex(
-                    f"source={source_hash}|target_id={target_id}|opts={repr(sorted(swap_options.items()))}|model={self.model_path}|frames={max_frames}"
+            t_stage = time.perf_counter()
+            source_hash = _image_sha256_hex(source_img)
+            target_hash = _image_sha256_hex(target_img)
+            target_face_cache_file = _face_cache_path_for_target(target_cache_file)
+            target_face_position_file = _face_position_cache_path_for_target(target_cache_file)
+            source_result_dir = RESULTS_CACHE_DIR / source_hash
+            source_result_dir.mkdir(parents=True, exist_ok=True)
+            cache_key = _sha256_hex(
+                f"source={source_hash}|target={target_hash}|opts={repr(sorted(swap_options.items()))}|model=default|mode={'square' if only_face_square else 'full'}"
+            )
+            result_path = source_result_dir / f"{cache_key}.jpg"
+            mark("prepare_cache_key", t_stage)
+
+            def _run_swap() -> tuple[bytes, tuple[int, int, int, int] | None]:
+                runtime_target_image = target_img
+                used_face_cache = False
+                cached_face_position = None
+                run_swap_stage_times_ms: dict[str, float] = {}
+
+                def run_swap_mark(stage_name: str, stage_start: float) -> None:
+                    run_swap_stage_times_ms[stage_name] = (time.perf_counter() - stage_start) * 1000
+
+                if only_face_square and target_face_cache_file.exists():
+                    runtime_target_image = Image.open(target_face_cache_file).convert("RGB")
+                    used_face_cache = True
+                    cached_face_position = _read_face_position(target_face_position_file)
+                    run_swap_stage_times_ms["face_square_cache_hit"] = 1.0
+                elif only_face_square:
+                    t_detect = time.perf_counter()
+                    import cv2
+                    import numpy as np
+
+                    target_bgr = cv2.cvtColor(np.array(target_img), cv2.COLOR_RGB2BGR)
+                    faces = analyze_faces(target_bgr)
+                    run_swap_mark("detect_target_face", t_detect)
+                    if len(faces) == 0:
+                        raise RuntimeError("No target face found to crop")
+
+                    largest_face = max(
+                        faces,
+                        key=lambda face: max(0.0, float(face.bbox[2] - face.bbox[0])) * max(0.0, float(face.bbox[3] - face.bbox[1])),
+                    )
+                    crop_box = _square_from_bbox(tuple(largest_face.bbox), target_img.width, target_img.height)
+                    runtime_target_image = target_img.crop(crop_box)
+                    cached_face_position = crop_box
+                    used_face_cache = True
+                    t_save_face_cache = time.perf_counter()
+                    with RESULT_LOCK:
+                        if not target_face_cache_file.exists():
+                            runtime_target_image.save(target_face_cache_file, format="PNG")
+                        if not target_face_position_file.exists():
+                            _write_face_position(target_face_position_file, crop_box)
+                    run_swap_mark("save_face_square_cache", t_save_face_cache)
+
+                t_swap = time.perf_counter()
+                swapped_img, bboxes, _ = swap_face(
+                    source_img=source_img,
+                    target_img=runtime_target_image,
+                    model=_pick_swap_model(),
+                    **swap_options,
                 )
-                result_video_path = VIDEOS_RESULTS_DIR / f"{cache_key}.mp4"
-                
-                with RESULT_LOCK:
-                    if result_video_path.exists():
-                        body = result_video_path.read_bytes()
-                        mark("video_cache_hit", t_video)
-                        self._send_video(body)
-                        self._log_request_timing(request_start, "video_cache_hit", request_id, stage_times_ms)
-                        return
+                run_swap_mark("swap", t_swap)
 
-                # Extraction
-                frames_in_dir = video_cache_dir / "frames_in"
-                _extract_frames(video_path, frames_in_dir, max_frames)
-                
-                # Processing
-                frames_out_dir = video_cache_dir / f"frames_out_{cache_key}"
-                frames_out_dir.mkdir(parents=True, exist_ok=True)
-                
-                input_frames = sorted(frames_in_dir.glob("frame_*.png"))
-                if max_frames:
-                    input_frames = input_frames[:max_frames]
-                
-                # Determine the base URL for internal requests (Uvicorn port)
-                # We assume the user runs on port 8008 as per their command
-                internal_port = int(os.environ.get("REACTOR_PORT", "8008"))
-                internal_base_url = f"http://127.0.0.1:{internal_port}/swap"
-
-                def _process_frame(frame_path: Path):
-                    out_frame_path = frames_out_dir / frame_path.name
-                    if out_frame_path.exists():
-                        return
-                    
-                    try:
-                        if DISTRIBUTED_VIDEO_PROCESSING:
-                            # Build query params for internal request
-                            query_params = {}
-                            # Add all original parameters first
-                            for key, vals in params.items():
-                                if key not in ["source_url", "target_url", "frames"]:
-                                    # Propagate all values if multiple exist
-                                    query_params[key] = ",".join(vals)
-                            
-                            # Override with local paths for the specific frame
-                            _, source_cache_file = _load_image(source_url, SOURCES_CACHE_DIR)
-                            query_params["source_url"] = str(source_cache_file.absolute())
-                            query_params["target_url"] = str(frame_path.absolute())
-                            
-                            resp = requests.get(internal_base_url, params=query_params, timeout=60)
-                            if resp.status_code == 200:
-                                # The result is already saved in RESULTS_CACHE_DIR by the worker
-                                # We just need to find it and copy/link it to frames_out_dir
-                                # Or more simply, since we know the cache_key for this specific frame:
-                                frame_target_hash = _sha256_hex(str(frame_path.absolute())) # This is how _load_image hashes local paths
-                                # Wait, _load_image hashes CONTENT for local files. 
-                                # Let's just read the response and save it.
-                                with open(out_frame_path, "wb") as f:
-                                    f.write(resp.content)
-                            else:
-                                LOGGER.error("Distributed processing failed for frame %s: %s", frame_path, resp.text)
-                        else:
-                            frame_img = Image.open(frame_path).convert("RGB")
-                            swapped_img, _, _ = swap_face(
-                                source_img=source_img,
-                                target_img=frame_img,
-                                model=self.model_path,
-                                **swap_options,
-                            )
-                            swapped_img.save(out_frame_path, format="PNG")
-                    except Exception as e:
-                        LOGGER.error("Error processing frame %s: %s", frame_path, e)
-
-                # Process frames in parallel (either locally via threads or distributed via HTTP)
-                list(SWAP_EXECUTOR.map(_process_frame, input_frames))
-                
-                # Assembly
-                fps = _get_video_fps(video_path)
-                _assemble_video(frames_out_dir, result_video_path, fps)
-                
-                body = result_video_path.read_bytes()
-                mark("video_processed", t_video)
-                self._send_video(body)
-                self._log_request_timing(request_start, "video_processed", request_id, stage_times_ms)
-                return
-
-            else:
-                t_stage = time.perf_counter()
-                target_img, target_cache_file = _load_image(
-                    target_url,
-                    TARGETS_CACHE_DIR,
-                    timing_prefix="target_load",
-                    timings_out=stage_times_ms,
-                )
-                mark("load_target", t_stage)
-
-                t_stage = time.perf_counter()
-                source_hash = _image_sha256_hex(source_img)
-                target_hash = _image_sha256_hex(target_img)
-                target_face_cache_file = _face_cache_path_for_target(target_cache_file)
-                target_face_position_file = _face_position_cache_path_for_target(target_cache_file)
-                source_result_dir = RESULTS_CACHE_DIR / source_hash
-                source_result_dir.mkdir(parents=True, exist_ok=True)
-                cache_key = _sha256_hex(
-                    f"source={source_hash}|target={target_hash}|opts={repr(sorted(swap_options.items()))}|model={self.model_path}|mode={'square' if only_face_square else 'full'}"
-                )
-                result_path = source_result_dir / f"{cache_key}.jpg"
-                mark("prepare_cache_key", t_stage)
-
-                def _run_swap() -> tuple[bytes, tuple[int, int, int, int] | None]:
-                    runtime_target_image = target_img
-                    used_face_cache = False
-                    cached_face_position = None
-                    run_swap_stage_times_ms: dict[str, float] = {}
-
-                    def run_swap_mark(stage_name: str, stage_start: float) -> None:
-                        run_swap_stage_times_ms[stage_name] = (time.perf_counter() - stage_start) * 1000
-
-                    if only_face_square and target_face_cache_file.exists():
-                        # IMPORTANT:
-                        # When sidecar face cache exists, /swap_face_square must run ONLY on that file.
-                        # We do not analyze/crop/use full target image in this branch.
-                        runtime_target_image = Image.open(target_face_cache_file).convert("RGB")
-                        used_face_cache = True
-                        cached_face_position = _read_face_position(target_face_position_file)
-                        run_swap_stage_times_ms["face_square_cache_hit"] = 1.0
-                    elif only_face_square:
-                        t_detect = time.perf_counter()
-                        import cv2
-                        import numpy as np
-
-                        target_bgr = cv2.cvtColor(np.array(target_img), cv2.COLOR_RGB2BGR)
-                        faces = analyze_faces(target_bgr)
-                        run_swap_mark("detect_target_face", t_detect)
-                        if len(faces) == 0:
-                            raise RuntimeError("No target face found to crop")
-
-                        largest_face = max(
-                            faces,
-                            key=lambda face: max(0.0, float(face.bbox[2] - face.bbox[0])) * max(0.0, float(face.bbox[3] - face.bbox[1])),
-                        )
-                        crop_box = _square_from_bbox(tuple(largest_face.bbox), target_img.width, target_img.height)
-                        runtime_target_image = target_img.crop(crop_box)
-                        cached_face_position = crop_box
-                        used_face_cache = True
-                        t_save_face_cache = time.perf_counter()
+                crop_box = None
+                output_image = swapped_img
+                if only_face_square:
+                    if used_face_cache:
+                        crop_box = cached_face_position
+                    else:
+                        if not bboxes:
+                            raise RuntimeError("No swapped target face found to crop")
+                        crop_box = _square_from_bbox(tuple(bboxes[0]), swapped_img.width, swapped_img.height)
+                        output_image = swapped_img.crop(crop_box)
                         with RESULT_LOCK:
                             if not target_face_cache_file.exists():
-                                runtime_target_image.save(target_face_cache_file, format="PNG")
+                                raw_target_face = target_img.crop(crop_box)
+                                raw_target_face.save(target_face_cache_file, format="PNG")
                             if not target_face_position_file.exists():
                                 _write_face_position(target_face_position_file, crop_box)
-                        run_swap_mark("save_face_square_cache", t_save_face_cache)
 
-                    t_swap = time.perf_counter()
-                    swapped_img, bboxes, _ = swap_face(
-                        source_img=source_img,
-                        target_img=runtime_target_image,
-                        model=self.model_path,
-                        **swap_options,
-                    )
-                    run_swap_mark("swap", t_swap)
+                output = io.BytesIO()
+                t_encode = time.perf_counter()
+                output_image.save(output, format="JPEG", quality=95)
+                body_inner = output.getvalue()
+                run_swap_mark("encode_jpeg", t_encode)
 
-                    crop_box = None
-                    output_image = swapped_img
-                    if only_face_square:
-                        if used_face_cache:
-                            crop_box = cached_face_position
-                        else:
-                            if not bboxes:
-                                raise RuntimeError("No swapped target face found to crop")
-                            crop_box = _square_from_bbox(tuple(bboxes[0]), swapped_img.width, swapped_img.height)
-                            output_image = swapped_img.crop(crop_box)
-                            with RESULT_LOCK:
-                                if not target_face_cache_file.exists():
-                                    raw_target_face = target_img.crop(crop_box)
-                                    raw_target_face.save(target_face_cache_file, format="PNG")
-                                if not target_face_position_file.exists():
-                                    _write_face_position(target_face_position_file, crop_box)
-
-                    output = io.BytesIO()
-                    t_encode = time.perf_counter()
-                    output_image.save(output, format="JPEG", quality=95)
-                    body_inner = output.getvalue()
-                    run_swap_mark("encode_jpeg", t_encode)
-
-                    t_write_result_cache = time.perf_counter()
-                    with RESULT_LOCK:
-                        if not result_path.exists():
-                            result_path.write_bytes(body_inner)
-                    run_swap_mark("write_result_cache", t_write_result_cache)
-
-                    stage_times_ms.update(run_swap_stage_times_ms)
-                    return body_inner, crop_box
-
-                t_cache_check = time.perf_counter()
+                t_write_result_cache = time.perf_counter()
                 with RESULT_LOCK:
-                    if result_path.exists() and not only_face_square:
-                        body = result_path.read_bytes()
-                        mark("cache_lookup", t_cache_check)
-                        self._send_jpeg(body)
-                        self._log_request_timing(request_start, "cache_hit", request_id, stage_times_ms)
-                        return
-                mark("cache_lookup", t_cache_check)
+                    if not result_path.exists():
+                        result_path.write_bytes(body_inner)
+                run_swap_mark("write_result_cache", t_write_result_cache)
 
-                t_exec = time.perf_counter()
-                body, crop_box = SWAP_EXECUTOR.submit(_run_swap).result()
-                mark("executor_wait", t_exec)
-                if crop_box is not None:
-                    left, top, right, bottom = crop_box
-                    cookie_value = quote(f"x={left},y={top},w={right - left},h={bottom - top}")
-                    self._send_jpeg(body, set_cookie=f"swapped_face_pos={cookie_value}; Path=/; SameSite=Lax")
-                else:
-                    self._send_jpeg(body)
-                self._log_request_timing(request_start, "processed", request_id, stage_times_ms)
-        except Exception as exc:
-            status_code = 502 if isinstance(exc, RuntimeError) and str(exc).startswith("Failed to download image") else 500
-            source_url_values = params.get("source_url", []) if "params" in locals() else []
-            target_url_values = params.get("target_url", []) if "params" in locals() else []
-            error_message = str(exc)
-            LOGGER.exception(
-                "[swap][error] req_id=%s status=%s path=%s source_url_count=%s target_url_count=%s source_url=%s target_url=%s exc_type=%s exc=%s",
-                request_id,
-                status_code,
-                self.path,
-                len(source_url_values),
-                len(target_url_values),
-                source_url_values[0] if source_url_values else None,
-                target_url_values[0] if target_url_values else None,
-                type(exc).__name__,
-                error_message,
-            )
+                stage_times_ms.update(run_swap_stage_times_ms)
+                return body_inner, crop_box
 
-            error = error_message.encode("utf-8", errors="ignore")
-            self.send_response(status_code)
-            self.send_header("Content-Type", "text/plain; charset=utf-8")
-            self.send_header("Content-Length", str(len(error)))
-            self.end_headers()
-            self.wfile.write(error)
-            self._log_request_timing(request_start, "error", request_id, stage_times_ms)
+            t_cache_check = time.perf_counter()
+            with RESULT_LOCK:
+                if result_path.exists() and not only_face_square:
+                    body = result_path.read_bytes()
+                    mark("cache_lookup", t_cache_check)
+                    _log_timing(request_id, path, (time.perf_counter() - t_stage), "cache_hit", stage_times_ms)
+                    return 200, {"Content-Type": "image/jpeg"}, body
+            mark("cache_lookup", t_cache_check)
 
-    def _send_jpeg(self, body: bytes, set_cookie: str | None = None) -> None:
-        self.send_response(200)
-        self.send_header("Content-Type", "image/jpeg")
-        self.send_header("Content-Length", str(len(body)))
-        if set_cookie is not None:
-            self.send_header("Set-Cookie", set_cookie)
-        self.end_headers()
-        self.wfile.write(body)
+            t_exec = time.perf_counter()
+            body, crop_box = SWAP_EXECUTOR.submit(_run_swap).result()
+            mark("executor_wait", t_exec)
+            headers = {"Content-Type": "image/jpeg"}
+            if crop_box is not None:
+                left, top, right, bottom = crop_box
+                cookie_value = quote(f"x={left},y={top},w={right - left},h={bottom - top}")
+                headers["Set-Cookie"] = f"swapped_face_pos={cookie_value}; Path=/; SameSite=Lax"
+            
+            _log_timing(request_id, path, (time.perf_counter() - t_stage), "processed", stage_times_ms)
+            return 200, headers, body
 
-    def _send_video(self, body: bytes) -> None:
-        self.send_response(200)
-        self.send_header("Content-Type", "video/mp4")
+    except Exception as exc:
+        LOGGER.exception("[swap][error] req_id=%s path=%s exc=%s", request_id, path, exc)
+        return 500, {}, str(exc).encode("utf-8", errors="ignore")
+
+
+def _log_timing(request_id: str, path: str, elapsed_sec: float, outcome: str, stage_times_ms: dict[str, float]) -> None:
+    elapsed_ms = elapsed_sec * 1000
+    stage_parts = [f"{stage}={duration:.2f}ms" for stage, duration in sorted(stage_times_ms.items())]
+    stages_str = " ".join(stage_parts)
+    LOGGER.info("[swap] req_id=%s outcome=%s elapsed_ms=%.2f path=%s %s", request_id, outcome, elapsed_ms, path, stages_str)
+
+
+class SwapHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        request_id = uuid.uuid4().hex[:8]
+        parsed = urlparse(self.path)
+        params = parse_qs(parsed.query)
+        
+        status, headers, body = process_swap_request(parsed.path, params, request_id)
+        
+        self.send_response(status)
+        for k, v in headers.items():
+            self.send_header(k, v)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
-
-    def _log_request_timing(
-        self,
-        start: float,
-        outcome: str,
-        request_id: str,
-        stage_times_ms: dict[str, float] | None = None,
-    ) -> None:
-        elapsed_ms = (time.perf_counter() - start) * 1000
-        if stage_times_ms:
-            stage_parts = [f"{stage}={duration:.2f}ms" for stage, duration in sorted(stage_times_ms.items())]
-            stages_str = " ".join(stage_parts)
-            LOGGER.info("[swap] req_id=%s outcome=%s elapsed_ms=%.2f path=%s %s", request_id, outcome, elapsed_ms, self.path, stages_str)
-            return
-        LOGGER.info("[swap] req_id=%s outcome=%s elapsed_ms=%.2f path=%s", request_id, outcome, elapsed_ms, self.path)
 
 
 def main() -> None:

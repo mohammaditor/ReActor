@@ -21,7 +21,9 @@ from reactor_utils import (
     move_path,
     get_image_md5hash,
     progress_bar,
-    progress_bar_reset
+    progress_bar_reset,
+    save_faces,
+    load_faces
 )
 from scripts.r_faceboost import swapper, restorer
 
@@ -77,6 +79,8 @@ TARGET_FACES = None
 TARGET_IMAGE_HASH = None
 TARGET_FACES_LIST = []
 TARGET_IMAGE_LIST_HASH = []
+
+FACES_CACHE_DIR = None
 
 def unload_model(model):
     if model is not None:
@@ -275,11 +279,25 @@ def swap_face(
             source_img = cv2.cvtColor(np.array(source_img), cv2.COLOR_RGB2BGR)
 
             if SOURCE_IMAGE_HASH != current_hash:
-                logger.status("Analyzing Source Image...")
-                SOURCE_FACES = analyze_faces(source_img)
-                SOURCE_IMAGE_HASH = current_hash
+                # Try disk cache first
+                face_cache_file = None
+                if FACES_CACHE_DIR is not None:
+                    face_cache_file = os.path.join(FACES_CACHE_DIR, f"{current_hash}.safetensors")
+                    if os.path.exists(face_cache_file):
+                        SOURCE_FACES = load_faces(face_cache_file)
+                        if SOURCE_FACES:
+                            logger.status("Using Disk Cached Source Faces...")
+                            SOURCE_IMAGE_HASH = current_hash
+                
+                if SOURCE_IMAGE_HASH != current_hash:
+                    logger.status("Analyzing Source Image...")
+                    SOURCE_FACES = analyze_faces(source_img)
+                    SOURCE_IMAGE_HASH = current_hash
+                    # Save to disk cache
+                    if FACES_CACHE_DIR is not None and SOURCE_FACES:
+                        save_faces(SOURCE_FACES, face_cache_file)
             else:
-                logger.status("Using Cached Source Faces...")
+                logger.status("Using Memory Cached Source Faces...")
             
             source_faces = SOURCE_FACES
 

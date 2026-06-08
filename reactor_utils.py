@@ -200,12 +200,38 @@ def save_face_model(face: Face, filename: str) -> None:
         print(f"Error: {e}")
 
 
-def load_face_model(filename: str):
-    face = {}
-    with safe_open(filename, framework="pt") as f:
-        for k in f.keys():
-            face[k] = f.get_tensor(k).numpy()
-    return Face(face)
+def save_faces(faces: list[Face], filename: str) -> None:
+    try:
+        tensors = {}
+        for i, face in enumerate(faces):
+            prefix = f"face{i}_"
+            for k in ["bbox", "kps", "det_score", "landmark_3d_68", "pose", "landmark_2d_106", "embedding", "gender", "age"]:
+                if k in face:
+                    v = face[k]
+                    if v is not None:
+                        tensors[f"{prefix}{k}"] = torch.tensor(v)
+        save_file(tensors, filename)
+    except Exception as e:
+        print(f"Error saving faces: {e}")
+
+
+def load_faces(filename: str) -> list[Face]:
+    try:
+        faces_data = {}
+        with safe_open(filename, framework="pt") as f:
+            for k in f.keys():
+                parts = k.split("_", 1)
+                idx = int(parts[0][4:])
+                key = parts[1]
+                if idx not in faces_data:
+                    faces_data[idx] = {}
+                faces_data[idx][key] = f.get_tensor(k).numpy()
+        
+        sorted_idxs = sorted(faces_data.keys())
+        return [Face(faces_data[i]) for i in sorted_idxs]
+    except Exception as e:
+        print(f"Error loading faces: {e}")
+        return []
 
 
 def get_ort_session():

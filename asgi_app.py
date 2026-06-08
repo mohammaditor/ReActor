@@ -1,20 +1,10 @@
 import os
 import sys
 import logging
-import threading
-from http.server import ThreadingHTTPServer
-from typing import Callable, Awaitable
+import uuid
+from urllib.parse import parse_qs
 
-import requests
-
-from run import SwapHandler
-
-_INTERNAL_HOST = os.environ.get("REACTOR_INTERNAL_HOST", "127.0.0.1")
-_INTERNAL_PORT = int(os.environ.get("REACTOR_INTERNAL_PORT", "18004"))
-_INTERNAL_BASE = f"http://{_INTERNAL_HOST}:{_INTERNAL_PORT}"
-
-_server_started = False
-_server_lock = threading.Lock()
+from run import process_swap_request
 
 LOGGER = logging.getLogger("reactor.asgi")
 if not LOGGER.handlers:
@@ -25,27 +15,11 @@ LOGGER.setLevel(logging.INFO)
 LOGGER.propagate = False
 
 
-def _ensure_internal_server() -> None:
-    global _server_started
-    if _server_started:
-        return
-    with _server_lock:
-        if _server_started:
-            return
-        server = ThreadingHTTPServer((_INTERNAL_HOST, _INTERNAL_PORT), SwapHandler)
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        _server_started = True
-        LOGGER.info("Internal swap server started at %s:%s", _INTERNAL_HOST, _INTERNAL_PORT)
-
-
 async def app(scope, receive, send):
     if scope["type"] != "http":
         await send({"type": "http.response.start", "status": 500, "headers": []})
         await send({"type": "http.response.body", "body": b"Unsupported scope type"})
         return
-
-    _ensure_internal_server()
 
     method = scope.get("method", "GET")
     if method != "GET":
@@ -53,29 +27,25 @@ async def app(scope, receive, send):
         await send({"type": "http.response.body", "body": b"Method Not Allowed"})
         return
 
+    request_id = uuid.uuid4().hex[:8]
     raw_path = scope.get("raw_path", b"").decode("utf-8", errors="ignore")
     query_string = scope.get("query_string", b"").decode("utf-8", errors="ignore")
-    target_url = f"{_INTERNAL_BASE}{raw_path}"
-    if query_string:
-        target_url = f"{target_url}?{query_string}"
+    params = parse_qs(query_string)
 
     try:
-        LOGGER.info("Proxying request to internal server: path=%s query_length=%s", raw_path, len(query_string))
-        resp = requests.get(target_url, timeout=600, proxies={"http": None, "https": None})
-        LOGGER.info("Internal response status=%s content_type=%s target=%s", resp.status_code, resp.headers.get("Content-Type"), target_url)
-        if resp.status_code >= 500:
-            LOGGER.error("Internal error response status=%s body_preview=%r", resp.status_code, resp.content[:500])
-        headers = []
-        content_type = resp.headers.get("Content-Type")
-        if content_type:
-            headers.append([b"content-type", content_type.encode("utf-8")])
-        set_cookie = resp.headers.get("Set-Cookie")
-        if set_cookie:
-            headers.append([b"set-cookie", set_cookie.encode("utf-8")])
-        await send({"type": "http.response.start", "status": resp.status_code, "headers": headers})
-        await send({"type": "http.response.body", "body": resp.content})
+        status, headers, body = process_swap_request(raw_path, params, request_id)
+        
+        asgi_headers = []
+        for k, v in headers.items():
+            asgi_headers.append([k.lower().encode("utf-8"), v.encode("utf-8")])
+        
+        # Ensure Content-Length is present
+        asgi_headers.append([b"content-length", str(len(body)).encode("utf-8")])
+
+        await send({"type": "http.response.start", "status": status, "headers": asgi_headers})
+        await send({"type": "http.response.body", "body": body})
     except Exception as exc:
-        LOGGER.exception("ASGI proxy failure for target_url=%s", target_url)
+        LOGGER.exception("ASGI processing failure for path=%s", raw_path)
         msg = str(exc).encode("utf-8", errors="ignore")
         await send({"type": "http.response.start", "status": 500, "headers": [[b"content-type", b"text/plain; charset=utf-8"]]})
         await send({"type": "http.response.body", "body": msg})
