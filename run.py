@@ -774,6 +774,10 @@ def process_swap_request(path: str, query_params: dict[str, list[str]], request_
             
             # Processing
             frames_out_dir = video_cache_dir / f"frames_out_{cache_key}"
+            # Cleanup old frames if they exist to avoid corruption from previous runs
+            if frames_out_dir.exists():
+                import shutil
+                shutil.rmtree(frames_out_dir)
             frames_out_dir.mkdir(parents=True, exist_ok=True)
             
             input_frames = sorted(frames_in_dir.glob("frame_*.png"))
@@ -807,8 +811,12 @@ def process_swap_request(path: str, query_params: dict[str, list[str]], request_
                         
                         resp = requests.get(internal_base_url, params=sub_query_params, timeout=60)
                         if resp.status_code == 200:
-                            with open(out_frame_path, "wb") as f:
-                                f.write(resp.content)
+                            # Verify PNG magic number
+                            if resp.content.startswith(b"\x89PNG\r\n\x1a\n"):
+                                with open(out_frame_path, "wb") as f:
+                                    f.write(resp.content)
+                            else:
+                                LOGGER.error("Received non-PNG content for frame %s (starts with: %s)", frame_path, resp.content[:8].hex())
                         else:
                             LOGGER.error("Distributed processing failed for frame %s: %s", frame_path, resp.text)
                     else:
@@ -927,7 +935,10 @@ def process_swap_request(path: str, query_params: dict[str, list[str]], request_
 
                 output = io.BytesIO()
                 t_encode = time.perf_counter()
-                output_image.save(output, format=req_format, quality=95)
+                if req_format == "JPEG":
+                    output_image.save(output, format="JPEG", quality=95)
+                else:
+                    output_image.save(output, format="PNG")
                 body_inner = output.getvalue()
                 run_swap_mark(f"encode_{req_format.lower()}", t_encode)
 
