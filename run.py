@@ -44,6 +44,10 @@ DEVICE_MODE = "gpu"
 # Even if 20+ requests arrive together, only this many are processed concurrently.
 MAX_CONCURRENT_REQUESTS = 4
 
+# If True, video frame processing is distributed across all Uvicorn workers
+# by sending internal HTTP requests to localhost.
+DISTRIBUTED_VIDEO_PROCESSING = False
+
 # Cache root folder for both downloaded inputs and processed outputs.
 # Structure:
 # - CACHE_DIR/sources/<hash_of_source_url_or_path>.img
@@ -55,7 +59,7 @@ TARGETS_CACHE_DIR = CACHE_DIR / "targets"
 RESULTS_CACHE_DIR = CACHE_DIR / "results"
 TMP_CACHE_DIR = CACHE_DIR / "tmp"
 VIDEOS_CACHE_DIR = CACHE_DIR / "videos"
-VIDEOS_RESULTS_DIR = RESULTS_CACHE_DIR / "videos"
+VIDEOS_RESULTS_DIR = VIDEOS_CACHE_DIR / "results"
 # ===============================================================
 
 SWAP_EXECUTOR = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_REQUESTS)
@@ -772,24 +776,56 @@ class SwapHandler(BaseHTTPRequestHandler):
                 if max_frames:
                     input_frames = input_frames[:max_frames]
                 
+                # Determine the base URL for internal requests (Uvicorn port)
+                # We assume the user runs on port 8008 as per their command
+                internal_port = int(os.environ.get("REACTOR_PORT", "8008"))
+                internal_base_url = f"http://127.0.0.1:{internal_port}/swap"
+
                 def _process_frame(frame_path: Path):
                     out_frame_path = frames_out_dir / frame_path.name
                     if out_frame_path.exists():
                         return
                     
                     try:
-                        frame_img = Image.open(frame_path).convert("RGB")
-                        swapped_img, _, _ = swap_face(
-                            source_img=source_img,
-                            target_img=frame_img,
-                            model=self.model_path,
-                            **swap_options,
-                        )
-                        swapped_img.save(out_frame_path, format="PNG")
+                        if DISTRIBUTED_VIDEO_PROCESSING:
+                            # Build query params for internal request
+                            # Source image is already in SOURCES_CACHE_DIR, we pass its local path
+                            _, source_cache_file = _load_image(source_url, SOURCES_CACHE_DIR)
+                            
+                            query_params = {
+                                "source_url": str(source_cache_file.absolute()),
+                                "target_url": str(frame_path.absolute()),
+                            }
+                            # Add other swap options
+                            for key, val in params.items():
+                                if key not in ["source_url", "target_url", "frames"]:
+                                    query_params[key] = val[0]
+                            
+                            resp = requests.get(internal_base_url, params=query_params, timeout=60)
+                            if resp.status_code == 200:
+                                # The result is already saved in RESULTS_CACHE_DIR by the worker
+                                # We just need to find it and copy/link it to frames_out_dir
+                                # Or more simply, since we know the cache_key for this specific frame:
+                                frame_target_hash = _sha256_hex(str(frame_path.absolute())) # This is how _load_image hashes local paths
+                                # Wait, _load_image hashes CONTENT for local files. 
+                                # Let's just read the response and save it.
+                                with open(out_frame_path, "wb") as f:
+                                    f.write(resp.content)
+                            else:
+                                LOGGER.error("Distributed processing failed for frame %s: %s", frame_path, resp.text)
+                        else:
+                            frame_img = Image.open(frame_path).convert("RGB")
+                            swapped_img, _, _ = swap_face(
+                                source_img=source_img,
+                                target_img=frame_img,
+                                model=self.model_path,
+                                **swap_options,
+                            )
+                            swapped_img.save(out_frame_path, format="PNG")
                     except Exception as e:
                         LOGGER.error("Error processing frame %s: %s", frame_path, e)
 
-                # Process frames in parallel
+                # Process frames in parallel (either locally via threads or distributed via HTTP)
                 list(SWAP_EXECUTOR.map(_process_frame, input_frames))
                 
                 # Assembly
