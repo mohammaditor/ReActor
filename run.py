@@ -715,6 +715,17 @@ def process_swap_request(path: str, query_params: dict[str, list[str]], request_
     frames_param = query_params.get("frames", [None])[0]
     max_frames = int(frames_param) if frames_param and frames_param.isdigit() else None
     
+    fps_param = query_params.get("fps", [None])[0]
+    # As per user request: if frames is provided, use it as FPS too, unless explicit fps is given
+    requested_fps = None
+    if fps_param:
+        try:
+            requested_fps = float(fps_param)
+        except ValueError:
+            pass
+    elif max_frames is not None:
+        requested_fps = float(max_frames)
+
     # Allow requesting PNG format for internal sub-requests
     req_format = query_params.get("format", [output_format])[0].upper()
     if req_format not in {"JPEG", "PNG"}:
