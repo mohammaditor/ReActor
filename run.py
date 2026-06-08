@@ -492,6 +492,7 @@ def _extract_frames(video_path: Path, output_dir: Path, max_frames: int | None =
 
     cmd = [
         "ffmpeg",
+        "-y",
         "-i", str(video_path),
         "-vsync", "0",
     ]
@@ -501,30 +502,43 @@ def _extract_frames(video_path: Path, output_dir: Path, max_frames: int | None =
     cmd.append(str(output_dir / "frame_%05d.png"))
     
     try:
-        subprocess.check_call(cmd, stderr=subprocess.DEVNULL)
-        return len(list(output_dir.glob("frame_*.png")))
-    except Exception as exc:
-        raise RuntimeError(f"Failed to extract frames: {exc}")
+        subprocess.check_output(cmd, stderr=subprocess.STDOUT)
+        extracted = list(output_dir.glob("frame_*.png"))
+        if not extracted:
+             raise RuntimeError("ffmpeg finished but no frames were extracted")
+        return len(extracted)
+    except subprocess.CalledProcessError as exc:
+        err_msg = exc.output.decode("utf-8", errors="ignore") if exc.output else str(exc)
+        LOGGER.error("ffmpeg extraction failed: %s", err_msg)
+        raise RuntimeError(f"Failed to extract frames: {err_msg}")
 
 
 def _assemble_video(frames_dir: Path, output_path: Path, fps: float, original_video: Path | None = None) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     
+    input_pattern = frames_dir / "frame_%05d.png"
+    if not any(frames_dir.glob("frame_*.png")):
+        raise RuntimeError(f"No frames found in {frames_dir} to assemble video")
+
     # Simple assembly without audio for now to keep it robust
     cmd = [
         "ffmpeg",
         "-y",
         "-framerate", str(fps),
-        "-i", str(frames_dir / "frame_%05d.png"),
+        "-i", str(input_pattern),
         "-c:v", "libx264",
         "-pix_fmt", "yuv420p",
         str(output_path)
     ]
     
     try:
-        subprocess.check_call(cmd, stderr=subprocess.DEVNULL)
-    except Exception as exc:
-        raise RuntimeError(f"Failed to assemble video: {exc}")
+        subprocess.check_output(cmd, stderr=subprocess.STDOUT)
+        if not output_path.exists():
+            raise RuntimeError("ffmpeg finished but output video file was not created")
+    except subprocess.CalledProcessError as exc:
+        err_msg = exc.output.decode("utf-8", errors="ignore") if exc.output else str(exc)
+        LOGGER.error("ffmpeg assembly failed: %s", err_msg)
+        raise RuntimeError(f"Failed to assemble video: {err_msg}")
 
 
 def _download_video(url: str, dest_path: Path) -> None:
@@ -681,7 +695,7 @@ def _build_swap_options(params: dict[str, list[str]]) -> dict:
     }
 
 
-def process_swap_request(path: str, query_params: dict[str, list[str]], request_id: str) -> tuple[int, dict[str, str], bytes]:
+def process_swap_request(path: str, query_params: dict[str, list[str]], request_id: str, output_format: str = "JPEG") -> tuple[int, dict[str, str], bytes]:
     """
     Core logic to handle a swap request (image or video).
     Returns (status_code, headers, body_bytes).
@@ -700,6 +714,11 @@ def process_swap_request(path: str, query_params: dict[str, list[str]], request_
     frames_param = query_params.get("frames", [None])[0]
     max_frames = int(frames_param) if frames_param and frames_param.isdigit() else None
     
+    # Allow requesting PNG format for internal sub-requests
+    req_format = query_params.get("format", [output_format])[0].upper()
+    if req_format not in {"JPEG", "PNG"}:
+        req_format = "JPEG"
+
     if not source_url or not target_url:
         return 400, {}, b"source_url and target_url are required"
 
@@ -775,10 +794,11 @@ def process_swap_request(path: str, query_params: dict[str, list[str]], request_
                         # Build query params for internal request
                         sub_query_params = {}
                         for key, vals in query_params.items():
-                            if key not in ["source_url", "target_url", "frames"]:
+                            if key not in ["source_url", "target_url", "frames", "format"]:
                                 sub_query_params[key] = ",".join(vals)
                         
-                        # Add a flag to identify sub-requests if needed
+                        # Request PNG to match our filename and preserve quality
+                        sub_query_params["format"] = "PNG"
                         sub_query_params["is_subrequest"] = "1"
                         
                         _, source_cache_file = _load_image(source_url, SOURCES_CACHE_DIR)
@@ -907,13 +927,13 @@ def process_swap_request(path: str, query_params: dict[str, list[str]], request_
 
                 output = io.BytesIO()
                 t_encode = time.perf_counter()
-                output_image.save(output, format="JPEG", quality=95)
+                output_image.save(output, format=req_format, quality=95)
                 body_inner = output.getvalue()
-                run_swap_mark("encode_jpeg", t_encode)
+                run_swap_mark(f"encode_{req_format.lower()}", t_encode)
 
                 t_write_result_cache = time.perf_counter()
                 with RESULT_LOCK:
-                    if not result_path.exists():
+                    if not result_path.exists() and req_format == "JPEG":
                         result_path.write_bytes(body_inner)
                 run_swap_mark("write_result_cache", t_write_result_cache)
 
@@ -922,7 +942,7 @@ def process_swap_request(path: str, query_params: dict[str, list[str]], request_
 
             t_cache_check = time.perf_counter()
             with RESULT_LOCK:
-                if result_path.exists() and not only_face_square:
+                if result_path.exists() and not only_face_square and req_format == "JPEG":
                     body = result_path.read_bytes()
                     mark("cache_lookup", t_cache_check)
                     _log_timing(request_id, path, (time.perf_counter() - t_stage), "cache_hit", stage_times_ms)
@@ -932,7 +952,8 @@ def process_swap_request(path: str, query_params: dict[str, list[str]], request_
             t_exec = time.perf_counter()
             body, crop_box = SWAP_EXECUTOR.submit(_run_swap).result()
             mark("executor_wait", t_exec)
-            headers = {"Content-Type": "image/jpeg"}
+            content_type = "image/png" if req_format == "PNG" else "image/jpeg"
+            headers = {"Content-Type": content_type}
             if crop_box is not None:
                 left, top, right, bottom = crop_box
                 cookie_value = quote(f"x={left},y={top},w={right - left},h={bottom - top}")
