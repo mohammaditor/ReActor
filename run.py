@@ -803,8 +803,10 @@ def process_swap_request(path: str, query_params: dict[str, list[str]], request_
             frames_out_dir.mkdir(parents=True, exist_ok=True)
             
             input_frames = sorted(frames_in_dir.glob("frame_*.jpg"))
-            if max_frames:
-                input_frames = input_frames[:max_frames]
+            # max_frames here is actually the requested FPS, we should NOT use it to slice.
+            # We only slice if max_limit is provided.
+            if max_limit:
+                input_frames = input_frames[:max_limit]
             
             # Determine the base URL for internal requests (Uvicorn port)
             internal_port = int(os.environ.get("REACTOR_PORT", "8008"))
