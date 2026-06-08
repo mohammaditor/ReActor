@@ -528,16 +528,25 @@ def _assemble_video(frames_dir: Path, output_path: Path, fps: float, original_vi
     if not any(frames_dir.glob("frame_*.jpg")):
         raise RuntimeError(f"No frames found in {frames_dir} to assemble video")
 
-    # Simple assembly without audio for now to keep it robust
+    # Assemble video. If original_video is provided, try to copy audio.
+    # Note: Using -shortest to match duration if audio is longer.
     cmd = [
         "ffmpeg",
         "-y",
         "-framerate", str(fps),
         "-i", str(input_pattern),
+    ]
+    
+    if original_video and original_video.exists():
+        cmd.extend(["-i", str(original_video)])
+        cmd.extend(["-map", "0:v:0", "-map", "1:a?", "-c:a", "copy"])
+    
+    cmd.extend([
         "-c:v", "libx264",
         "-pix_fmt", "yuv420p",
+        "-shortest",
         str(output_path)
-    ]
+    ])
     
     try:
         subprocess.check_output(cmd, stderr=subprocess.STDOUT)
