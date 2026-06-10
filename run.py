@@ -14,6 +14,8 @@ from urllib.parse import parse_qs, quote, unquote, urlparse
 from urllib.request import Request, urlopen
 from urllib.error import URLError, HTTPError
 import requests
+import cv2
+import numpy as np
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
