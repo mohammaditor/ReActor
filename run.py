@@ -1000,11 +1000,22 @@ def process_swap_request(path: str, query_params: dict[str, list[str]], request_
 
             t_cache_check = time.perf_counter()
             with RESULT_LOCK:
-                if result_path.exists() and not only_face_square and req_format == "JPEG":
+                if result_path.exists() and req_format == "JPEG":
                     body = result_path.read_bytes()
+                    crop_box = None
+                    if only_face_square:
+                        crop_box = _read_face_position(target_face_position_file)
+                    
                     mark("cache_lookup", t_cache_check)
                     _log_timing(request_id, path, (time.perf_counter() - t_stage), "cache_hit", stage_times_ms)
-                    return 200, {"Content-Type": "image/jpeg"}, body
+                    
+                    headers = {"Content-Type": "image/jpeg"}
+                    if crop_box is not None:
+                        left, top, right, bottom = crop_box
+                        cookie_value = quote(f"x={left},y={top},w={right - left},h={bottom - top}")
+                        headers["Set-Cookie"] = f"swapped_face_pos={cookie_value}; Path=/; SameSite=Lax"
+                    
+                    return 200, headers, body
             mark("cache_lookup", t_cache_check)
 
             t_exec = time.perf_counter()
