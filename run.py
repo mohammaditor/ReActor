@@ -96,6 +96,8 @@ def _sha256_hex(value: str) -> str:
 
 
 def _image_sha256_hex(image: Image.Image) -> str:
+    if hasattr(image, "reactor_hash"):
+        return image.reactor_hash
     normalized = image.convert("RGB")
     return hashlib.sha256(normalized.tobytes()).hexdigest()
 
@@ -736,8 +738,32 @@ def process_swap_request(path: str, query_params: dict[str, list[str]], request_
     def mark(stage_name: str, stage_start: float) -> None:
         stage_times_ms[stage_name] = (time.perf_counter() - stage_start) * 1000
 
-    if path not in {"/swap", "/swap_face_square"}:
-        return 404, {}, b"Use /swap or /swap_face_square"
+    if path not in {"/swap", "/swap_face_square", "/build_source_cache"}:
+        return 404, {}, b"Use /swap, /swap_face_square or /build_source_cache"
+
+    if path == "/build_source_cache":
+        source_url = query_params.get("source_url", [None])[0]
+        if not source_url:
+            return 400, {}, b"source_url is required"
+        try:
+            source_img, _ = _load_image(source_url, SOURCES_CACHE_DIR)
+            source_img_cv = cv2.cvtColor(np.array(source_img), cv2.COLOR_RGB2BGR)
+            faces = analyze_faces(source_img_cv)
+            if not faces:
+                return 404, {}, b"No faces detected in source"
+            
+            # The analyze_faces call above, via reactor_swapper's internal logic,
+            # will automatically trigger the disk cache save if FACES_CACHE_DIR is set.
+            # But let's be explicit to ensure it's saved.
+            from scripts.reactor_swapper import save_faces, get_image_md5hash, FACES_CACHE_DIR
+            if FACES_CACHE_DIR:
+                current_hash = get_image_md5hash(source_img)
+                face_cache_file = os.path.join(FACES_CACHE_DIR, f"{current_hash}.safetensors")
+                save_faces(faces, face_cache_file)
+            
+            return 200, {"Content-Type": "application/json"}, b'{"status": "success", "message": "Source face cached"}'
+        except Exception as e:
+            return 500, {}, str(e).encode("utf-8")
 
     only_face_square = path == "/swap_face_square"
     source_url = query_params.get("source_url", [None])[0]
