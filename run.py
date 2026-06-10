@@ -68,11 +68,13 @@ VIDEOS_RESULTS_DIR = VIDEOS_CACHE_DIR / "results"
 
 SWAP_EXECUTOR = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_REQUESTS)
 RESULT_LOCK = threading.Lock()
+MODEL_LOCK = threading.Lock()
 SSL_CONTEXT = ssl._create_unverified_context()
 KNOWN_HOSTING_IP = "45.149.77.233"
 
 # Memory cache for loaded images: {path_or_url: (Image, Path, content_hash, stat_or_None)}
 _IMAGE_LOADER_CACHE: dict[str, tuple[Image.Image, Path, str, Any]] = {}
+IMAGE_CACHE_MAX_ENTRIES = 128
 
 LOGGER = logging.getLogger("reactor.swap")
 if not LOGGER.handlers:
@@ -315,6 +317,10 @@ def _load_image(
             # For URLs, trust memory cache for the lifetime of the process/session
             _mark("mem_cache_hit", t_total)
             return cached_img, cached_file
+
+    # Image cache limit to prevent memory bloat
+    if len(_IMAGE_LOADER_CACHE) > IMAGE_CACHE_MAX_ENTRIES:
+        _IMAGE_LOADER_CACHE.clear()
 
     t_mkdir = time.perf_counter()
     cache_subdir.mkdir(parents=True, exist_ok=True)
@@ -749,8 +755,9 @@ def process_swap_request(path: str, query_params: dict[str, list[str]], request_
             return 400, {}, b"source_url is required"
         try:
             source_img, _ = _load_image(source_url, SOURCES_CACHE_DIR)
-            source_img_cv = cv2.cvtColor(np.array(source_img), cv2.COLOR_RGB2BGR)
-            faces = analyze_faces(source_img_cv)
+            with MODEL_LOCK:
+                source_img_cv = cv2.cvtColor(np.array(source_img), cv2.COLOR_RGB2BGR)
+                faces = analyze_faces(source_img_cv)
             if not faces:
                 return 404, {}, b"No faces detected in source"
             
@@ -896,12 +903,13 @@ def process_swap_request(path: str, query_params: dict[str, list[str]], request_
                             LOGGER.error("Distributed processing failed for frame %s: %s", frame_path, resp.text)
                     else:
                         frame_img = Image.open(frame_path).convert("RGB")
-                        swapped_img, _, _ = swap_face(
-                            source_img=source_img,
-                            target_img=frame_img,
-                            model=_pick_swap_model(),
-                            **swap_options,
-                        )
+                        with MODEL_LOCK:
+                            swapped_img, _, _ = swap_face(
+                                source_img=source_img,
+                                target_img=frame_img,
+                                model=_pick_swap_model(),
+                                **swap_options,
+                            )
                         swapped_img.save(out_frame_path, format="JPEG", quality=95)
                 except Exception as e:
                     LOGGER.error("Error processing frame %s: %s", frame_path, e)
@@ -960,8 +968,9 @@ def process_swap_request(path: str, query_params: dict[str, list[str]], request_
                     import cv2
                     import numpy as np
 
-                    target_bgr = cv2.cvtColor(np.array(target_img), cv2.COLOR_RGB2BGR)
-                    faces = analyze_faces(target_bgr)
+                    with MODEL_LOCK:
+                        target_bgr = cv2.cvtColor(np.array(target_img), cv2.COLOR_RGB2BGR)
+                        faces = analyze_faces(target_bgr)
                     run_swap_mark("detect_target_face", t_detect)
                     if len(faces) == 0:
                         raise RuntimeError("No target face found to crop")
@@ -979,16 +988,17 @@ def process_swap_request(path: str, query_params: dict[str, list[str]], request_
                         if not target_face_cache_file.exists():
                             runtime_target_image.save(target_face_cache_file, format="PNG")
                         if not target_face_position_file.exists():
-                            _write_face_position(target_face_position_file, crop_box)
+                            _write_face_position(path=target_face_position_file, crop_box=crop_box)
                     run_swap_mark("save_face_square_cache", t_save_face_cache)
 
                 t_swap = time.perf_counter()
-                swapped_img, bboxes, _ = swap_face(
-                    source_img=source_img,
-                    target_img=runtime_target_image,
-                    model=_pick_swap_model(),
-                    **swap_options,
-                )
+                with MODEL_LOCK:
+                    swapped_img, bboxes, _ = swap_face(
+                        source_img=source_img,
+                        target_img=runtime_target_image,
+                        model=_pick_swap_model(),
+                        **swap_options,
+                    )
                 run_swap_mark("swap", t_swap)
 
                 crop_box = None
@@ -1006,7 +1016,7 @@ def process_swap_request(path: str, query_params: dict[str, list[str]], request_
                                 raw_target_face = target_img.crop(crop_box)
                                 raw_target_face.save(target_face_cache_file, format="PNG")
                             if not target_face_position_file.exists():
-                                _write_face_position(target_face_position_file, crop_box)
+                                _write_face_position(path=target_face_position_file, crop_box=crop_box)
 
                 output = io.BytesIO()
                 t_encode = time.perf_counter()
@@ -1093,7 +1103,7 @@ def main() -> None:
     server = ThreadingHTTPServer((host, port), SwapHandler)
     print(f"ReActor standalone API is running on http://{host}:{port}")
     print(f"Models dir: {MODELS_DIR}")
-    print(f"Model file: {SwapHandler.model_path}")
+    print(f"Model file: {_pick_swap_model()}")
     print(f"Device mode: {os.environ.get('REACTOR_DEVICE', DEVICE_MODE)}")
     print(f"Max concurrent requests: {MAX_CONCURRENT_REQUESTS}")
     print(f"Cache dir: {CACHE_DIR}")

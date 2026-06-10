@@ -33,12 +33,15 @@ if cuda is not None:
 else:
     providers = ["CPUExecutionProvider"]
 
+_RESTORE_MODEL_CACHE = {}
 
 def get_restored_face(cropped_face,
                       face_restore_model,
                       face_restore_visibility,
                       codeformer_weight,
                       interpolation: str = "Bicubic"):
+
+    global _RESTORE_MODEL_CACHE
 
     if interpolation == "Bicubic":
         interpolate = cv2.INTER_CUBIC
@@ -61,10 +64,6 @@ def get_restored_face(cropped_face,
 
     cropped_face = cv2.resize(cropped_face, (face_size, face_size), interpolation=interpolate)
 
-    # For upscaling the base 128px face, I found bicubic interpolation to be the best compromise targeting antialiasing
-    # and detail preservation. Nearest is predictably unusable, Linear produces too much aliasing, and Lanczos produces
-    # too many hallucinations and artifacts/fringing.
-
     model_path = folder_paths.get_full_path("facerestore_models", face_restore_model)
     device = model_management.get_torch_device()
 
@@ -73,15 +72,15 @@ def get_restored_face(cropped_face,
     cropped_face_t = cropped_face_t.unsqueeze(0).to(device)
 
     try:
-
         with torch.no_grad():
-
             if ".onnx" in face_restore_model:  # ONNX models
-
-                ort_session = set_ort_session(model_path, providers=providers)
+                from reactor_utils import get_ort_session
+                ort_session = get_ort_session()
+                if ort_session is None or not hasattr(ort_session, "_model_path") or ort_session._model_path != model_path:
+                    ort_session = set_ort_session(model_path, providers=providers)
+                    ort_session._model_path = model_path
+                
                 ort_session_inputs = {}
-                facerestore_model = ort_session
-
                 for ort_session_input in ort_session.get_inputs():
                     if ort_session_input.name == "input":
                         cropped_face_prep = prepare_cropped_face(cropped_face)
@@ -94,32 +93,30 @@ def get_restored_face(cropped_face,
                 restored_face = normalize_cropped_face(output)
 
             else:  # PTH models
-
-                if "codeformer" in face_restore_model.lower():
-                    codeformer_net = ARCH_REGISTRY.get("CodeFormer")(
-                        dim_embd=512,
-                        codebook_size=1024,
-                        n_head=8,
-                        n_layers=9,
-                        connect_list=["32", "64", "128", "256"],
-                    ).to(device)
-                    checkpoint = torch.load(model_path)["params_ema"]
-                    codeformer_net.load_state_dict(checkpoint)
-                    facerestore_model = codeformer_net.eval()
-                else:
-                    sd = comfy.utils.load_torch_file(model_path, safe_load=True)
-                    facerestore_model = model_loading.load_state_dict(sd).eval()
-                    facerestore_model.to(device)
-
+                if face_restore_model not in _RESTORE_MODEL_CACHE:
+                    if "codeformer" in face_restore_model.lower():
+                        codeformer_net = ARCH_REGISTRY.get("CodeFormer")(
+                            dim_embd=512,
+                            codebook_size=1024,
+                            n_head=8,
+                            n_layers=9,
+                            connect_list=["32", "64", "128", "256"],
+                        ).to(device)
+                        checkpoint = torch.load(model_path)["params_ema"]
+                        codeformer_net.load_state_dict(checkpoint)
+                        _RESTORE_MODEL_CACHE[face_restore_model] = codeformer_net.eval()
+                    else:
+                        sd = comfy.utils.load_torch_file(model_path, safe_load=True)
+                        net = model_loading.load_state_dict(sd).eval()
+                        net.to(device)
+                        _RESTORE_MODEL_CACHE[face_restore_model] = net
+                
+                facerestore_model = _RESTORE_MODEL_CACHE[face_restore_model]
                 output = facerestore_model(cropped_face_t, w=codeformer_weight)[
                     0] if "codeformer" in face_restore_model.lower() else facerestore_model(cropped_face_t)[0]
                 restored_face = tensor2img(output, rgb2bgr=True, min_max=(-1, 1))
 
-        del output
-        torch.cuda.empty_cache()
-
     except Exception as error:
-
         print(f"\tFailed inference: {error}", file=sys.stderr)
         restored_face = tensor2img(cropped_face_t, rgb2bgr=True, min_max=(-1, 1))
 
