@@ -277,16 +277,18 @@ def swap_face(
             source_img_cv = cv2.cvtColor(np.array(source_img), cv2.COLOR_RGB2BGR)
             if SOURCE_IMAGE_HASH != current_hash:
                 face_cache_file = os.path.join(FACES_CACHE_DIR, f"{current_hash}.safetensors") if FACES_CACHE_DIR else None
-                if face_cache_file and os.path.exists(face_cache_file):
-                    SOURCE_FACES = load_faces(face_cache_file)
-                    if SOURCE_FACES:
-                        logger.status("Using Disk Cached Source Faces...")
-                        SOURCE_IMAGE_HASH = current_hash
+                loaded = load_faces(face_cache_file) if face_cache_file else None
+                if loaded is not None:
+                    SOURCE_FACES = loaded
+                    logger.status(f"Using Disk Cached Source Faces ({len(SOURCE_FACES)} found)...")
+                    SOURCE_IMAGE_HASH = current_hash
+                
                 if SOURCE_IMAGE_HASH != current_hash:
                     logger.status("Analyzing Source Image...")
                     SOURCE_FACES = analyze_faces(source_img_cv)
                     SOURCE_IMAGE_HASH = current_hash
-                    if face_cache_file and SOURCE_FACES: save_faces(SOURCE_FACES, face_cache_file)
+                    if face_cache_file:
+                        save_faces(SOURCE_FACES, face_cache_file)
             else:
                 logger.status("Using Memory Cached Source Faces...")
             source_faces = SOURCE_FACES
@@ -305,16 +307,18 @@ def swap_face(
             target_img_cv = cv2.cvtColor(np.array(target_img), cv2.COLOR_RGB2BGR)
             if TARGET_IMAGE_HASH != target_hash:
                 target_face_cache_file = os.path.join(FACES_CACHE_DIR, f"{target_hash}.safetensors") if FACES_CACHE_DIR else None
-                if target_face_cache_file and os.path.exists(target_face_cache_file):
-                    TARGET_FACES = load_faces(target_face_cache_file)
-                    if TARGET_FACES:
-                        logger.status("Using Disk Cached Target Faces...")
-                        TARGET_IMAGE_HASH = target_hash
+                loaded = load_faces(target_face_cache_file) if target_face_cache_file else None
+                if loaded is not None:
+                    TARGET_FACES = loaded
+                    logger.status(f"Using Disk Cached Target Faces ({len(TARGET_FACES)} found)...")
+                    TARGET_IMAGE_HASH = target_hash
+                
                 if TARGET_IMAGE_HASH != target_hash:
                     logger.status("Analyzing Target Image...")
                     TARGET_FACES = analyze_faces(target_img_cv)
                     TARGET_IMAGE_HASH = target_hash
-                    if target_face_cache_file and TARGET_FACES: save_faces(TARGET_FACES, target_face_cache_file)
+                    if target_face_cache_file:
+                        save_faces(TARGET_FACES, target_face_cache_file)
             else:
                 logger.status("Using Memory Cached Target Faces...")
             target_faces = TARGET_FACES

@@ -212,16 +212,22 @@ def save_faces(faces: list[Face], filename: str) -> None:
                     v = face[k]
                     if v is not None:
                         tensors[f"{prefix}{k}"] = torch.tensor(v)
+        # Even if tensors is empty, save_file will create a valid header
         save_file(tensors, filename)
     except Exception as e:
         print(f"Error saving faces: {e}")
 
 
-def load_faces(filename: str) -> list[Face]:
+def load_faces(filename: str) -> list[Face] | None:
+    if not os.path.exists(filename):
+        return None
     try:
         faces_data = {}
         with safe_open(filename, framework="pt") as f:
-            for k in f.keys():
+            keys = f.keys()
+            if not keys:
+                return []
+            for k in keys:
                 parts = k.split("_", 1)
                 idx = int(parts[0][4:])
                 key = parts[1]
@@ -232,8 +238,8 @@ def load_faces(filename: str) -> list[Face]:
         sorted_idxs = sorted(faces_data.keys())
         return [Face(faces_data[i]) for i in sorted_idxs]
     except Exception as e:
-        print(f"Error loading faces: {e}")
-        return []
+        print(f"Error loading faces from {filename}: {e}")
+        return None
 
 
 def get_ort_session():
