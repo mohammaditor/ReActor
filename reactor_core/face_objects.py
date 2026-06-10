@@ -64,7 +64,13 @@ class BaseONNXModel:
         if not os.path.exists(self.model_file):
             raise FileNotFoundError(f"Model file not found: {self.model_file}")
 
-        self.session = ort.InferenceSession(self.model_file, providers=self.providers)
+        opts = ort.SessionOptions()
+        opts.enable_cpu_mem_arena = False
+        opts.enable_mem_pattern = False
+        # Optional: set execution mode to sequential to save VRAM
+        opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+        
+        self.session = ort.InferenceSession(self.model_file, sess_options=opts, providers=self.providers)
         
         # Получаем параметры входов
         self.inputs = self.session.get_inputs()

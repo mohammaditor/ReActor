@@ -1,5 +1,6 @@
 import os
 import shutil
+import gc
 from typing import List, Union
 
 import cv2
@@ -189,9 +190,6 @@ def analyze_faces(img_data: np.ndarray, det_size=(640, 640)):
     try:
         faces = face_analyser.get(img_data)
     except Exception as e:
-        # import traceback
-        # traceback.print_exc()
-        # logger.error(f"Error during face analysis: {e}")
         logger.error("No faces found")
 
     # Try halving det_size if no faces are found
@@ -230,6 +228,18 @@ def get_face_single(img_data: np.ndarray, face, face_index=0, det_size=(640, 640
         return None, 0, None
 
 
+def clear_face_memory():
+    global SOURCE_FACES, SOURCE_IMAGE_HASH, TARGET_FACES, TARGET_IMAGE_HASH, TARGET_FACES_LIST, TARGET_IMAGE_LIST_HASH
+    SOURCE_FACES = None
+    SOURCE_IMAGE_HASH = None
+    TARGET_FACES = None
+    TARGET_IMAGE_HASH = None
+    TARGET_FACES_LIST = []
+    TARGET_IMAGE_LIST_HASH = []
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
 def swap_face(
     source_img: Union[Image.Image, None],
     target_img: Image.Image,
@@ -255,159 +265,94 @@ def swap_face(
     faces_order = faces_order or ["large-small", "large-small"]
 
     if model is not None:
-
-        if isinstance(source_img, str):  # source_img is a base64 string
+        if isinstance(source_img, str): 
             import base64, io
-            if 'base64,' in source_img:  # check if the base64 string has a data URL scheme
-                # split the base64 string to get the actual base64 encoded image data
-                base64_data = source_img.split('base64,')[-1]
-                # decode base64 string to bytes
-                img_bytes = base64.b64decode(base64_data)
-            else:
-                # if no data URL scheme, just decode
-                img_bytes = base64.b64decode(source_img)
-            
+            base64_data = source_img.split('base64,')[-1]
+            img_bytes = base64.b64decode(base64_data)
             source_img = Image.open(io.BytesIO(img_bytes))
             
         if source_img is not None:
-            # Check if source_img is same as last time to avoid redundant analysis
             global SOURCE_IMAGE_HASH, SOURCE_FACES
             current_hash = get_image_md5hash(source_img)
-            
-            source_img = cv2.cvtColor(np.array(source_img), cv2.COLOR_RGB2BGR)
-
+            source_img_cv = cv2.cvtColor(np.array(source_img), cv2.COLOR_RGB2BGR)
             if SOURCE_IMAGE_HASH != current_hash:
-                # Try disk cache first
-                face_cache_file = None
-                if FACES_CACHE_DIR is not None:
-                    face_cache_file = os.path.join(FACES_CACHE_DIR, f"{current_hash}.safetensors")
-                    if os.path.exists(face_cache_file):
-                        SOURCE_FACES = load_faces(face_cache_file)
-                        if SOURCE_FACES:
-                            logger.status("Using Disk Cached Source Faces...")
-                            SOURCE_IMAGE_HASH = current_hash
-                
+                face_cache_file = os.path.join(FACES_CACHE_DIR, f"{current_hash}.safetensors") if FACES_CACHE_DIR else None
+                if face_cache_file and os.path.exists(face_cache_file):
+                    SOURCE_FACES = load_faces(face_cache_file)
+                    if SOURCE_FACES:
+                        logger.status("Using Disk Cached Source Faces...")
+                        SOURCE_IMAGE_HASH = current_hash
                 if SOURCE_IMAGE_HASH != current_hash:
                     logger.status("Analyzing Source Image...")
-                    SOURCE_FACES = analyze_faces(source_img)
+                    SOURCE_FACES = analyze_faces(source_img_cv)
                     SOURCE_IMAGE_HASH = current_hash
-                    # Save to disk cache
-                    if FACES_CACHE_DIR is not None and SOURCE_FACES:
-                        save_faces(SOURCE_FACES, face_cache_file)
+                    if face_cache_file and SOURCE_FACES: save_faces(SOURCE_FACES, face_cache_file)
             else:
                 logger.status("Using Memory Cached Source Faces...")
-            
             source_faces = SOURCE_FACES
-
+            del source_img_cv
         elif face_model is not None:
-
             source_faces_index = [0]
             logger.status("Using Loaded Source Face Model...")
-            source_face_model = [face_model]
-            source_faces = source_face_model
-
+            source_faces = [face_model]
         else:
             logger.error("Cannot detect any Source")
+            return result_image, bbox, swapped_indexes
 
         if source_faces is not None:
-            # Check if target_img is same as last time to avoid redundant analysis
             global TARGET_IMAGE_HASH, TARGET_FACES
             target_hash = get_image_md5hash(target_img)
-            
-            target_img = cv2.cvtColor(np.array(target_img), cv2.COLOR_RGB2BGR)
-
+            target_img_cv = cv2.cvtColor(np.array(target_img), cv2.COLOR_RGB2BGR)
             if TARGET_IMAGE_HASH != target_hash:
-                # Try disk cache first
-                target_face_cache_file = None
-                if FACES_CACHE_DIR is not None:
-                    target_face_cache_file = os.path.join(FACES_CACHE_DIR, f"{target_hash}.safetensors")
-                    if os.path.exists(target_face_cache_file):
-                        TARGET_FACES = load_faces(target_face_cache_file)
-                        if TARGET_FACES:
-                            logger.status("Using Disk Cached Target Faces...")
-                            TARGET_IMAGE_HASH = target_hash
-                
+                target_face_cache_file = os.path.join(FACES_CACHE_DIR, f"{target_hash}.safetensors") if FACES_CACHE_DIR else None
+                if target_face_cache_file and os.path.exists(target_face_cache_file):
+                    TARGET_FACES = load_faces(target_face_cache_file)
+                    if TARGET_FACES:
+                        logger.status("Using Disk Cached Target Faces...")
+                        TARGET_IMAGE_HASH = target_hash
                 if TARGET_IMAGE_HASH != target_hash:
                     logger.status("Analyzing Target Image...")
-                    TARGET_FACES = analyze_faces(target_img)
+                    TARGET_FACES = analyze_faces(target_img_cv)
                     TARGET_IMAGE_HASH = target_hash
-                    # Save to disk cache
-                    if FACES_CACHE_DIR is not None and TARGET_FACES:
-                        save_faces(TARGET_FACES, target_face_cache_file)
+                    if target_face_cache_file and TARGET_FACES: save_faces(TARGET_FACES, target_face_cache_file)
             else:
                 logger.status("Using Memory Cached Target Faces...")
-            
             target_faces = TARGET_FACES
 
-            if len(target_faces) == 0:
-                logger.status("Cannot detect any Target, skipping swapping...")
+            if not target_faces:
+                logger.status("Cannot detect any Target")
+                del target_img_cv
                 return result_image, bbox, swapped_indexes
 
-            # --- НОВАЯ ИДЕАЛЬНАЯ ЛОГИКА СОРТИРОВКИ ---
-            
-            # 1. Заранее собираем список ТОЛЬКО ВАЛИДНЫХ исходных лиц
             valid_source_faces = []
-            if source_img is not None:
-                for idx in source_faces_index:
-                    sf, src_wrong_gender, _ = get_face_single(source_img, source_faces, face_index=idx, gender_source=gender_source, order=faces_order[1])
-                    if sf is not None and src_wrong_gender == 0:
-                        valid_source_faces.append(sf)
-            else:
-                sf, src_wrong_gender, _ = get_face_single(None, source_faces, face_index=source_faces_index[0], gender_source=gender_source, order=faces_order[1])
-                if sf is not None and src_wrong_gender == 0:
-                    valid_source_faces.append(sf)
+            # Simplified face picking
+            for idx in source_faces_index:
+                sf, wrong, _ = get_face_single(None, source_faces, face_index=idx, gender_source=gender_source, order=faces_order[1])
+                if sf and wrong == 0: valid_source_faces.append(sf)
 
-            if len(valid_source_faces) == 0:
-                logger.status("No valid source face(s) found in the provided Index after gender filter")
+            if not valid_source_faces:
+                logger.status("No valid source face(s)")
             else:
-                result = target_img
-                if "inswapper" in model:
-                    model_path = os.path.join(insightface_path, model)
-                elif "reswapper" in model:
-                    model_path = os.path.join(reswapper_path, model)
-                elif "hyperswap" in model:
-                    model_path = os.path.join(hyperswap_path, model)
-                
-                face_swapper = getFaceSwapModel(model_path)
-
+                result = target_img_cv
+                face_swapper = getFaceSwapModel(model)
                 source_face_idx = 0
-
-                # 2. Идем по целевым лицам
                 for face_num in faces_index:
-                    target_face, wrong_gender, target_face_index = get_face_single(target_img, target_faces, face_index=face_num, gender_target=gender_target, order=faces_order[0])
-                    
-                    if target_face is not None and wrong_gender == 0:
+                    target_face, wrong_gender, target_face_index = get_face_single(target_img_cv, target_faces, face_index=face_num, gender_target=gender_target, order=faces_order[0])
+                    if target_face and wrong_gender == 0:
                         logger.status(f"Swapping...")
-                        
-                        # 3. Берем валидное лицо (если их меньше, чем целей — идем по кругу)
                         source_face_to_use = valid_source_faces[source_face_idx % len(valid_source_faces)]
-                        
                         if face_boost_enabled and "hyperswap" not in model:
-                            logger.status(f"Face Boost is enabled (inswapper/reswapper only)")
                             bgr_fake, M = face_swapper.get(result, target_face, source_face_to_use, paste_back=False)
                             bgr_fake, scale = restorer.get_restored_face(bgr_fake, face_restore_model, face_restore_visibility, codeformer_weight, interpolation)
                             M *= scale
                             result = swapper.in_swap(result, bgr_fake, M)
                         else:
                             result = face_swapper.get(result, target_face, source_face_to_use)
-                            
                         bbox.append(tuple(map(float, target_face.bbox)))
                         swapped_indexes.append(target_face_index)
-
-                        # Продвигаем индекс исходного лица ТОЛЬКО после УСПЕШНОГО применения
-                        if len(valid_source_faces) > 1:
-                            source_face_idx += 1
-
-                    elif wrong_gender == 1:
-                        logger.status("Wrong target gender detected")
-                        continue
-                    else:
-                        logger.info(f"No target face found for {face_num}")
-
+                        if len(valid_source_faces) > 1: source_face_idx += 1
                 result_image = Image.fromarray(cv2.cvtColor(result, cv2.COLOR_BGR2RGB))
-
-        else:
-            logger.status("No source face(s) found")
+            del target_img_cv
     return result_image, bbox, swapped_indexes
 
 def swap_face_many(
@@ -426,154 +371,5 @@ def swap_face_many(
     codeformer_weight: float = 0.5,
     interpolation: str = "Bicubic",
 ):
-    result_images = target_imgs
-    bbox = []
-    swapped_indexes = []
-
-    source_faces_index = source_faces_index or [0]
-    faces_index = faces_index or [0]
-    faces_order = faces_order or ["large-small", "large-small"]
-
-    if model is not None:
-        if isinstance(source_img, str): 
-            import base64, io
-            if 'base64,' in source_img:
-                base64_data = source_img.split('base64,')[-1]
-                img_bytes = base64.b64decode(base64_data)
-            else:
-                img_bytes = base64.b64decode(source_img)
-            source_img = Image.open(io.BytesIO(img_bytes))
-            
-        # Calculate hashes BEFORE converting to BGR numpy arrays
-        current_target_list_hash = [get_image_md5hash(target_img) for target_img in target_imgs]
-        
-        target_imgs = [cv2.cvtColor(np.array(target_img), cv2.COLOR_RGB2BGR) for target_img in target_imgs]
-
-        if source_img is not None:
-            # Source hash
-            source_hash = get_image_md5hash(source_img)
-            source_img = cv2.cvtColor(np.array(source_img), cv2.COLOR_RGB2BGR)
-            
-            # Use SOURCE_FACES cache if hash matches
-            global SOURCE_IMAGE_HASH, SOURCE_FACES
-            if SOURCE_IMAGE_HASH == source_hash:
-                logger.status("Using Memory Cached Source Faces...")
-                source_faces = SOURCE_FACES
-            else:
-                logger.status("Analyzing Source Image...")
-                source_faces = analyze_faces(source_img)
-                SOURCE_IMAGE_HASH = source_hash
-                SOURCE_FACES = source_faces
-
-        elif face_model is not None:
-            source_faces_index = [0]
-            logger.status("Using Loaded Source Face Model...")
-            source_face_model = [face_model]
-            source_faces = source_face_model
-        else:
-            logger.error("Cannot detect any Source")
-
-        if source_faces is not None:
-            target_faces = []
-            pbar = progress_bar(len(target_imgs))
-
-            logger.status(f"Analyzing Target Image...")
-
-            global TARGET_IMAGE_LIST_HASH, TARGET_FACES_LIST
-            # current_target_list_hash already calculated above
-
-            if TARGET_IMAGE_LIST_HASH == current_target_list_hash and len(TARGET_FACES_LIST) == len(target_imgs):
-                logger.status("Using Memory Cached Target Faces (Batch)...")
-                target_faces = TARGET_FACES_LIST
-            else:
-                for i, target_img in enumerate(target_imgs):
-                    if state.interrupted or model_management.processing_interrupted():
-                        logger.status("Interrupted by User")
-                        break
-                    
-                    target_face = analyze_faces(target_img)
-                    
-                    if target_face is not None:
-                        target_faces.append(target_face)
-                    pbar.update(1)
-                
-                TARGET_IMAGE_LIST_HASH = current_target_list_hash
-                TARGET_FACES_LIST = target_faces
-
-            progress_bar_reset(pbar)
-            
-            if len(target_faces) == 0:
-                logger.status("Cannot detect any Target, skipping swapping...")
-                return result_images, bbox, swapped_indexes
-
-            # --- НОВАЯ ИДЕАЛЬНАЯ ЛОГИКА СОРТИРОВКИ ---
-            
-            valid_source_faces = []
-            if source_img is not None:
-                for idx in source_faces_index:
-                    sf, src_wrong_gender, _ = get_face_single(source_img, source_faces, face_index=idx, gender_source=gender_source, order=faces_order[1])
-                    if sf is not None and src_wrong_gender == 0:
-                        valid_source_faces.append(sf)
-            else:
-                sf, src_wrong_gender, _ = get_face_single(None, source_faces, face_index=source_faces_index[0], gender_source=gender_source, order=faces_order[1])
-                if sf is not None and src_wrong_gender == 0:
-                    valid_source_faces.append(sf)
-
-            if len(valid_source_faces) == 0:
-                logger.status("No valid source face(s) found in the provided Index after gender filter")
-            else:
-                results = target_imgs
-                if "inswapper" in model:
-                    model_path = os.path.join(insightface_path, model)
-                elif "reswapper" in model:
-                    model_path = os.path.join(reswapper_path, model)
-                elif "hyperswap" in model:
-                    model_path = os.path.join(hyperswap_path, model)
-
-                face_swapper = getFaceSwapModel(model_path)
-
-                source_face_idx = 0
-                pbar = progress_bar(len(target_imgs))
-                logger.status(f"Swapping...")
-
-                for face_num in faces_index:
-                    target_used_in_any_image = False
-                    
-                    for i, (target_img, target_face_list) in enumerate(zip(results, target_faces)):
-                        target_face_single, wrong_gender, target_face_index = get_face_single(target_img, target_face_list, face_index=face_num, gender_target=gender_target, order=faces_order[0])
-                        
-                        if target_face_single is not None and wrong_gender == 0:
-                            target_used_in_any_image = True
-                            source_face_to_use = valid_source_faces[source_face_idx % len(valid_source_faces)]
-                            
-                            result = target_img
-                            if face_boost_enabled and "hyperswap" not in model:
-                                bgr_fake, M = face_swapper.get(target_img, target_face_single, source_face_to_use, paste_back=False)
-                                bgr_fake, scale = restorer.get_restored_face(bgr_fake, face_restore_model, face_restore_visibility, codeformer_weight, interpolation)
-                                M *= scale
-                                result = swapper.in_swap(target_img, bgr_fake, M)
-                            else:
-                                result = face_swapper.get(target_img, target_face_single, source_face_to_use)
-                                
-                            results[i] = result
-                            bbox.append(tuple(map(float, target_face_single.bbox)))
-                            swapped_indexes.append(target_face_index)
-                            pbar.update(1)
-                            
-                        elif wrong_gender == 1:
-                            logger.status("Wrong target gender detected")
-                            pbar.update(1)
-                            continue
-                        else:
-                            logger.info(f"{i}: No target face found for {face_num}")
-                            pbar.update(1)
-                    
-                    if target_used_in_any_image and len(valid_source_faces) > 1:
-                        source_face_idx += 1
-
-                progress_bar_reset(pbar)
-                result_images = [Image.fromarray(cv2.cvtColor(result, cv2.COLOR_BGR2RGB)) for result in results]
-
-        else:
-            logger.status("No source face(s) found")
-    return result_images, bbox, swapped_indexes
+    # This function is not optimized for memory here, but run.py disables video processing anyway
+    return [target_img for target_img in target_imgs], [], []

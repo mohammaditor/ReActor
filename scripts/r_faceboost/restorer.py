@@ -74,9 +74,11 @@ def get_restored_face(cropped_face,
     try:
         with torch.no_grad():
             if ".onnx" in face_restore_model:  # ONNX models
-                from reactor_utils import get_ort_session
+                from reactor_utils import get_ort_session, clear_ort_session
                 ort_session = get_ort_session()
                 if ort_session is None or not hasattr(ort_session, "_model_path") or ort_session._model_path != model_path:
+                    clear_ort_session()
+                    gc.collect()
                     ort_session = set_ort_session(model_path, providers=providers)
                     ort_session._model_path = model_path
                 
