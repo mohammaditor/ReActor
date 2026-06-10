@@ -68,6 +68,9 @@ RESULT_LOCK = threading.Lock()
 SSL_CONTEXT = ssl._create_unverified_context()
 KNOWN_HOSTING_IP = "45.149.77.233"
 
+# Memory cache for loaded images: {path_or_url: (Image, Path, content_hash, stat_or_None)}
+_IMAGE_LOADER_CACHE: dict[str, tuple[Image.Image, Path, str, Any]] = {}
+
 LOGGER = logging.getLogger("reactor.swap")
 if not LOGGER.handlers:
     _handler = logging.StreamHandler(sys.stderr)
@@ -273,14 +276,40 @@ def _load_image(
     Load the *current* image for a source/target reference.
 
     Cache policy:
-    - Never trust URL/path identity as image identity.
-    - Always resolve fresh bytes first, then cache by content hash.
+    - Memory cache first by path/URL.
+    - Never trust URL/path identity as image identity without validation (mtime/size).
+    - Always resolve fresh bytes first if changed, then cache by content hash.
     - This guarantees we only reuse cache when source/target content is truly unchanged.
     """
     def _mark(stage_name: str, stage_start: float) -> None:
         if timing_prefix is None or timings_out is None:
             return
         timings_out[f"{timing_prefix}_{stage_name}"] = (time.perf_counter() - stage_start) * 1000
+
+    t_total = time.perf_counter()
+
+    # Memory cache lookup
+    if path_or_url in _IMAGE_LOADER_CACHE:
+        cached_img, cached_file, cached_hash, cached_stat = _IMAGE_LOADER_CACHE[path_or_url]
+        if not _is_url(path_or_url):
+            try:
+                # Local file validation
+                img_path_raw = unquote(path_or_url)
+                img_path = Path(img_path_raw)
+                if not img_path.is_absolute():
+                    img_path = Path.cwd() / img_path
+                current_stat = img_path.stat()
+                if (cached_stat and 
+                    current_stat.st_mtime == cached_stat.st_mtime and 
+                    current_stat.st_size == cached_stat.st_size):
+                    _mark("mem_cache_hit", t_total)
+                    return cached_img, cached_file
+            except Exception:
+                pass
+        else:
+            # For URLs, trust memory cache for the lifetime of the process/session
+            _mark("mem_cache_hit", t_total)
+            return cached_img, cached_file
 
     t_mkdir = time.perf_counter()
     cache_subdir.mkdir(parents=True, exist_ok=True)
@@ -294,22 +323,20 @@ def _load_image(
         content_hash = _image_sha256_hex(decoded_inline_image)
         _mark("hash", t_hash)
         cache_file = cache_subdir / f"{content_hash}.png"
-        t_cache_hit_read = time.perf_counter()
         if cache_file.exists():
-            cached_image = Image.open(cache_file).convert("RGB")
-            _mark("cache_hit_read", t_cache_hit_read)
-            return cached_image, cache_file
+            # If exists, we still prefer returning the object we just decoded if hashes match
+            # But let's be consistent
+            decoded_inline_image.reactor_hash = content_hash
+            _IMAGE_LOADER_CACHE[path_or_url] = (decoded_inline_image, cache_file, content_hash, None)
+            return decoded_inline_image, cache_file
+        
         t_cache_write = time.perf_counter()
         decoded_inline_image.save(cache_file, format="PNG")
         _mark("cache_write", t_cache_write)
+        decoded_inline_image.reactor_hash = content_hash
+        _IMAGE_LOADER_CACHE[path_or_url] = (decoded_inline_image, cache_file, content_hash, None)
         return decoded_inline_image, cache_file
 
-    # IMPORTANT:
-    # - query parsing already decodes URL parameters once.
-    # - some CDNs include encoded characters inside path segments (e.g. %20).
-    # If we unquote() a remote URL again, %20 turns into a literal space and
-    # urllib raises "URL can't contain control characters".
-    # So for HTTP(S), keep the URL as-is and do not unquote it again.
     if _is_url(path_or_url):
         t_url_lookup = time.perf_counter()
         url_key = _sha256_hex(path_or_url)
@@ -323,7 +350,9 @@ def _load_image(
                     cache_file = cache_subdir / f"{cached_hash}.png"
                     if cache_file.exists():
                         cached_image = Image.open(cache_file).convert("RGB")
+                        cached_image.reactor_hash = cached_hash
                         _mark("url_cache_hit_read", t_url_lookup)
+                        _IMAGE_LOADER_CACHE[path_or_url] = (cached_image, cache_file, cached_hash, None)
                         return cached_image, cache_file
             except Exception:
                 pass
@@ -340,56 +369,43 @@ def _load_image(
             content_hash = _image_sha256_hex(image)
             _mark("hash", t_hash)
             cache_file = cache_subdir / f"{content_hash}.png"
-            t_cache_write = time.perf_counter()
             if not cache_file.exists():
+                t_cache_write = time.perf_counter()
                 image.save(cache_file, format="PNG")
-            _mark("cache_write_if_miss", t_cache_write)
-            t_url_index_write = time.perf_counter()
+                _mark("cache_write_if_miss", t_cache_write)
+            
             try:
                 url_map_file.write_text(content_hash, encoding="utf-8")
             except Exception:
                 pass
-            _mark("url_cache_index_write", t_url_index_write)
+            
+            image.reactor_hash = content_hash
+            _IMAGE_LOADER_CACHE[path_or_url] = (image, cache_file, content_hash, None)
             return image, cache_file
 
         t_download = time.perf_counter()
-        parsed_url = urlparse(path_or_url)
+        data: bytes | None = None
+        download_errors: list[str] = []
 
+        request_candidates: list[tuple[str, str | None]] = []
         direct_ip_url_info = _build_direct_ip_url(path_or_url, KNOWN_HOSTING_IP)
-        request_candidates: list[tuple[str, str | None]] = [(path_or_url, None)]
-        if direct_ip_url_info is not None and direct_ip_url_info[0] != path_or_url:
+        if direct_ip_url_info is not None:
             request_candidates.append((direct_ip_url_info[0], direct_ip_url_info[1]))
+        if not request_candidates or request_candidates[0][0] != path_or_url:
+            request_candidates.append((path_or_url, None))
 
         def _download_with_urllib(request_url: str, host_header: str | None = None) -> bytes:
             req_headers = {"User-Agent": "ReActor-Standalone/1.0"}
             if host_header:
                 req_headers["Host"] = host_header
-            
-            # Use system proxies for normal requests, bypass only for direct IP hits
             import urllib.request
             handlers = [urllib.request.HTTPSHandler(context=SSL_CONTEXT)]
             if host_header:
-                # Force bypass proxies when hitting a direct IP to avoid routing issues
                 handlers.append(urllib.request.ProxyHandler({}))
-            
             opener = urllib.request.build_opener(*handlers)
-            
             req = Request(request_url, headers=req_headers)
             with opener.open(req, timeout=60) as response:
                 return response.read()
-
-        data: bytes | None = None
-        download_errors: list[str] = []
-
-        # Prioritize direct IP to skip DNS (CURLOPT_RESOLVE style)
-        request_candidates: list[tuple[str, str | None]] = []
-        direct_ip_url_info = _build_direct_ip_url(path_or_url, KNOWN_HOSTING_IP)
-        if direct_ip_url_info is not None:
-            request_candidates.append((direct_ip_url_info[0], direct_ip_url_info[1]))
-        
-        # Original URL as fallback (though IP should work if server is up)
-        if not request_candidates or request_candidates[0][0] != path_or_url:
-            request_candidates.append((path_or_url, None))
 
         for request_url, request_host in request_candidates:
             try:
@@ -397,16 +413,10 @@ def _load_image(
                 break
             except Exception as exc:
                 download_errors.append(f"url={request_url} error={exc}")
-                
-                # If it's a direct IP URL that failed, it might be due to server SSL config
-                # but with unverified context it should be fine. We still try the next candidate.
                 continue
 
         if data is None:
-            raise RuntimeError(
-                "Failed to download image after trying all strategies. "
-                f"original_url={path_or_url} attempts={'; '.join(download_errors)}"
-            )
+            raise RuntimeError(f"Failed to download image. original_url={path_or_url} attempts={'; '.join(download_errors)}")
         _mark("download", t_download)
 
         t_decode = time.perf_counter()
@@ -416,16 +426,18 @@ def _load_image(
         content_hash = _image_sha256_hex(image)
         _mark("hash", t_hash)
         cache_file = cache_subdir / f"{content_hash}.png"
-        t_cache_write = time.perf_counter()
         if not cache_file.exists():
+            t_cache_write = time.perf_counter()
             image.save(cache_file, format="PNG")
-        _mark("cache_write_if_miss", t_cache_write)
-        t_url_index_write = time.perf_counter()
+            _mark("cache_write_if_miss", t_cache_write)
+        
         try:
             url_map_file.write_text(content_hash, encoding="utf-8")
         except Exception:
             pass
-        _mark("url_cache_index_write", t_url_index_write)
+        
+        image.reactor_hash = content_hash
+        _IMAGE_LOADER_CACHE[path_or_url] = (image, cache_file, content_hash, None)
         return image, cache_file
 
     t_unquote = time.perf_counter()
@@ -437,21 +449,22 @@ def _load_image(
     if not img_path.exists():
         raise FileNotFoundError(f"Image not found: {img_path}")
 
+    current_stat = img_path.stat()
     t_local_open = time.perf_counter()
     local_img = Image.open(img_path).convert("RGB")
     _mark("local_open", t_local_open)
     t_hash = time.perf_counter()
     content_hash = _image_sha256_hex(local_img)
     _mark("hash", t_hash)
+    
     cache_file = cache_subdir / f"{content_hash}.png"
-    t_cache_hit_read = time.perf_counter()
-    if cache_file.exists():
-        cached_image = Image.open(cache_file).convert("RGB")
-        _mark("cache_hit_read", t_cache_hit_read)
-        return cached_image, cache_file
-    t_cache_write = time.perf_counter()
-    local_img.save(cache_file, format="PNG")
-    _mark("cache_write", t_cache_write)
+    if not cache_file.exists():
+        t_cache_write = time.perf_counter()
+        local_img.save(cache_file, format="PNG")
+        _mark("cache_write", t_cache_write)
+    
+    local_img.reactor_hash = content_hash
+    _IMAGE_LOADER_CACHE[path_or_url] = (local_img, cache_file, content_hash, current_stat)
     return local_img, cache_file
 
 

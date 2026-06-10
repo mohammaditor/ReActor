@@ -177,6 +177,8 @@ def addLoggingLevel(levelName, levelNum, methodName=None):
 
 
 def get_image_md5hash(image: Image.Image):
+    if hasattr(image, "reactor_hash"):
+        return image.reactor_hash
     md5hash = hashlib.md5(image.tobytes())
     return md5hash.hexdigest()
 

@@ -465,16 +465,26 @@ def swap_face_many(
 
             logger.status(f"Analyzing Target Image...")
 
-            for i, target_img in enumerate(target_imgs):
-                if state.interrupted or model_management.processing_interrupted():
-                    logger.status("Interrupted by User")
-                    break
+            global TARGET_IMAGE_LIST_HASH, TARGET_FACES_LIST
+            current_target_list_hash = [get_image_md5hash(target_img) for target_img in target_imgs]
+
+            if TARGET_IMAGE_LIST_HASH == current_target_list_hash and len(TARGET_FACES_LIST) == len(target_imgs):
+                logger.status("Using Memory Cached Target Faces (Batch)...")
+                target_faces = TARGET_FACES_LIST
+            else:
+                for i, target_img in enumerate(target_imgs):
+                    if state.interrupted or model_management.processing_interrupted():
+                        logger.status("Interrupted by User")
+                        break
+                    
+                    target_face = analyze_faces(target_img)
+                    
+                    if target_face is not None:
+                        target_faces.append(target_face)
+                    pbar.update(1)
                 
-                target_face = analyze_faces(target_img)
-                
-                if target_face is not None:
-                    target_faces.append(target_face)
-                pbar.update(1)
+                TARGET_IMAGE_LIST_HASH = current_target_list_hash
+                TARGET_FACES_LIST = target_faces
 
             progress_bar_reset(pbar)
             
