@@ -16,6 +16,7 @@ from urllib.error import URLError, HTTPError
 import requests
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from concurrent.futures import ThreadPoolExecutor
+from typing import Any
 
 from PIL import Image
 
