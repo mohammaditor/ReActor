@@ -444,12 +444,26 @@ def swap_face_many(
                 img_bytes = base64.b64decode(source_img)
             source_img = Image.open(io.BytesIO(img_bytes))
             
+        # Calculate hashes BEFORE converting to BGR numpy arrays
+        current_target_list_hash = [get_image_md5hash(target_img) for target_img in target_imgs]
+        
         target_imgs = [cv2.cvtColor(np.array(target_img), cv2.COLOR_RGB2BGR) for target_img in target_imgs]
 
         if source_img is not None:
+            # Source hash
+            source_hash = get_image_md5hash(source_img)
             source_img = cv2.cvtColor(np.array(source_img), cv2.COLOR_RGB2BGR)
-            logger.status("Analyzing Source Image...")
-            source_faces = analyze_faces(source_img)
+            
+            # Use SOURCE_FACES cache if hash matches
+            global SOURCE_IMAGE_HASH, SOURCE_FACES
+            if SOURCE_IMAGE_HASH == source_hash:
+                logger.status("Using Memory Cached Source Faces...")
+                source_faces = SOURCE_FACES
+            else:
+                logger.status("Analyzing Source Image...")
+                source_faces = analyze_faces(source_img)
+                SOURCE_IMAGE_HASH = source_hash
+                SOURCE_FACES = source_faces
 
         elif face_model is not None:
             source_faces_index = [0]
@@ -466,7 +480,7 @@ def swap_face_many(
             logger.status(f"Analyzing Target Image...")
 
             global TARGET_IMAGE_LIST_HASH, TARGET_FACES_LIST
-            current_target_list_hash = [get_image_md5hash(target_img) for target_img in target_imgs]
+            # current_target_list_hash already calculated above
 
             if TARGET_IMAGE_LIST_HASH == current_target_list_hash and len(TARGET_FACES_LIST) == len(target_imgs):
                 logger.status("Using Memory Cached Target Faces (Batch)...")
