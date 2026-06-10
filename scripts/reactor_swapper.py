@@ -269,8 +269,6 @@ def swap_face(
             
             source_img = Image.open(io.BytesIO(img_bytes))
             
-        target_img = cv2.cvtColor(np.array(target_img), cv2.COLOR_RGB2BGR)
-
         if source_img is not None:
             # Check if source_img is same as last time to avoid redundant analysis
             global SOURCE_IMAGE_HASH, SOURCE_FACES
@@ -312,9 +310,34 @@ def swap_face(
             logger.error("Cannot detect any Source")
 
         if source_faces is not None:
+            # Check if target_img is same as last time to avoid redundant analysis
+            global TARGET_IMAGE_HASH, TARGET_FACES
+            target_hash = get_image_md5hash(target_img)
+            
+            target_img = cv2.cvtColor(np.array(target_img), cv2.COLOR_RGB2BGR)
 
-            logger.status("Analyzing Target Image...")
-            target_faces = analyze_faces(target_img)
+            if TARGET_IMAGE_HASH != target_hash:
+                # Try disk cache first
+                target_face_cache_file = None
+                if FACES_CACHE_DIR is not None:
+                    target_face_cache_file = os.path.join(FACES_CACHE_DIR, f"{target_hash}.safetensors")
+                    if os.path.exists(target_face_cache_file):
+                        TARGET_FACES = load_faces(target_face_cache_file)
+                        if TARGET_FACES:
+                            logger.status("Using Disk Cached Target Faces...")
+                            TARGET_IMAGE_HASH = target_hash
+                
+                if TARGET_IMAGE_HASH != target_hash:
+                    logger.status("Analyzing Target Image...")
+                    TARGET_FACES = analyze_faces(target_img)
+                    TARGET_IMAGE_HASH = target_hash
+                    # Save to disk cache
+                    if FACES_CACHE_DIR is not None and TARGET_FACES:
+                        save_faces(TARGET_FACES, target_face_cache_file)
+            else:
+                logger.status("Using Memory Cached Target Faces...")
+            
+            target_faces = TARGET_FACES
 
             if len(target_faces) == 0:
                 logger.status("Cannot detect any Target, skipping swapping...")
