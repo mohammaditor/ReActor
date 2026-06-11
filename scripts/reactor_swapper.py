@@ -172,7 +172,10 @@ def get_face_gender(
     logger.info("%s Face %s: Detected Gender -%s-", operated, face_index, sel_gender_str)
 
     # Если пол не совпадает с тем, что заказал юзер
-    if actual_gender != expected_gender:
+    # Fallback: Allow Unknown (-1) for Female condition (1)
+    is_match = (actual_gender == expected_gender) or (gender_condition == 1 and actual_gender == -1)
+    
+    if not is_match:
         logger.info(f"{operated} Face {face_index}: WRONG gender ({sel_gender_str})")
         return face_selected, 1, face_index  # 1 означает флаг wrong_gender = True (цикл его пропустит)
 
@@ -374,6 +377,71 @@ def swap_face_many(
     face_restore_visibility: int = 1,
     codeformer_weight: float = 0.5,
     interpolation: str = "Bicubic",
+    source_man_img: Union[Image.Image, None] = None,
 ):
-    # This function is not optimized for memory here, but run.py disables video processing anyway
-    return [target_img for target_img in target_imgs], [], []
+    results = []
+    all_bboxes = []
+    all_swapped_indexes = []
+    
+    total = len(target_imgs)
+    pbar = progress_bar(total)
+    
+    for i, target_img in enumerate(target_imgs):
+        if state.interrupted:
+            break
+            
+        # Stage 1: Primary Source (Female if source_man present)
+        s1_gender_target = 1 if source_man_img else gender_target
+        res_img, bboxes, s_idx = swap_face(
+            source_img=source_img,
+            target_img=target_img,
+            model=model,
+            source_faces_index=source_faces_index,
+            faces_index=faces_index,
+            gender_source=gender_source,
+            gender_target=s1_gender_target,
+            face_model=face_model,
+            faces_order=faces_order,
+            face_boost_enabled=face_boost_enabled,
+            face_restore_model=face_restore_model,
+            face_restore_visibility=face_restore_visibility,
+            codeformer_weight=codeformer_weight,
+            interpolation=interpolation,
+        )
+        
+        # Stage 2: source_man (Male only)
+        if source_man_img:
+            res_img, bboxes_man, s_idx_man = swap_face(
+                source_img=source_man_img,
+                target_img=res_img,
+                model=model,
+                source_faces_index=source_faces_index,
+                faces_index=faces_index,
+                gender_source=gender_source,
+                gender_target=2, # Male
+                face_model=None, # source_man is always an image here
+                faces_order=faces_order,
+                face_boost_enabled=face_boost_enabled,
+                face_restore_model=face_restore_model,
+                face_restore_visibility=face_restore_visibility,
+                codeformer_weight=codeformer_weight,
+                interpolation=interpolation,
+            )
+            if bboxes_man:
+                bboxes.extend(bboxes_man)
+                s_idx.extend(s_idx_man)
+
+        results.append(res_img)
+        all_bboxes.append(bboxes)
+        all_swapped_indexes.append(s_idx)
+        
+        pbar.update(1)
+        
+        # Periodic memory cleanup for long batches (videos)
+        if (i + 1) % 10 == 0:
+            clear_face_memory()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    progress_bar_reset(pbar)
+    return results, all_bboxes, all_swapped_indexes

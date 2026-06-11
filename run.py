@@ -281,6 +281,65 @@ def _load_image(path_or_url: str, cache_subdir: Path, timing_prefix: str | None 
     return local_img, cache_file
 
 
+def _load_video(path_or_url: str, cache_subdir: Path) -> Path:
+    cache_subdir.mkdir(parents=True, exist_ok=True)
+    
+    if _is_url(path_or_url):
+        url_key = _sha256_hex(path_or_url)
+        url_map_dir = cache_subdir / "_url_index"
+        url_map_dir.mkdir(parents=True, exist_ok=True)
+        url_map_file = url_map_dir / f"{url_key}.txt"
+        
+        if url_map_file.exists():
+            try:
+                cached_filename = url_map_file.read_text(encoding="utf-8").strip()
+                if cached_filename:
+                    cache_file = cache_subdir / cached_filename
+                    if cache_file.exists():
+                        return cache_file
+            except Exception: pass
+
+        # Download
+        direct_ip_url_info = _build_direct_ip_url(path_or_url, KNOWN_HOSTING_IP)
+        req_url = direct_ip_url_info[0] if direct_ip_url_info else path_or_url
+        host_header = direct_ip_url_info[1] if direct_ip_url_info else None
+        
+        req_headers = {"User-Agent": "ReActor-Standalone/1.0"}
+        if host_header: req_headers["Host"] = host_header
+        
+        resp = requests.get(req_url, headers=req_headers, timeout=300, verify=False, stream=True)
+        resp.raise_for_status()
+        
+        # Use content-disposition or URL path to get extension
+        ext = ".mp4"
+        parsed = urlparse(path_or_url)
+        path_ext = Path(unquote(parsed.path)).suffix
+        if path_ext in {".mp4", ".avi", ".mov", ".mkv", ".webm", ".flv", ".mpeg", ".mpg"}:
+            ext = path_ext
+            
+        content_hash = hashlib.sha256()
+        tmp_file = cache_subdir / f"tmp_{uuid.uuid4().hex}{ext}"
+        with open(tmp_file, "wb") as f:
+            for chunk in resp.iter_content(chunk_size=8192):
+                f.write(chunk)
+                content_hash.update(chunk)
+        
+        final_hash = content_hash.hexdigest()
+        cache_file = cache_subdir / f"{final_hash}{ext}"
+        if cache_file.exists():
+            tmp_file.unlink()
+        else:
+            tmp_file.rename(cache_file)
+            
+        try: url_map_file.write_text(cache_file.name, encoding="utf-8")
+        except Exception: pass
+        return cache_file
+
+    v_path = Path(unquote(path_or_url))
+    if not v_path.is_absolute(): v_path = Path.cwd() / v_path
+    return v_path
+
+
 def _is_video(path_or_url: str) -> bool:
     video_extensions = {".mp4", ".avi", ".mov", ".mkv", ".webm", ".flv", ".mpeg", ".mpg"}
     parsed = urlparse(path_or_url)
@@ -365,10 +424,9 @@ def process_swap_request(path: str, query_params: dict[str, list[str]], request_
             return 200, {"Content-Type": "application/json"}, b'{"status": "success", "message": "Source face cached"}'
         except Exception as e: return 500, {}, str(e).encode("utf-8")
 
-    only_face_square = path == "/swap_face_square"
-    source_url = query_params.get("source_url", [None])[0]
-    source_man_url = query_params.get("source_man", [None])[0]
-    target_url = query_params.get("target_url", [None])[0]
+    source_url = query_params.get("source_url", query_params.get("source", [None]))[0]
+    source_man_url = query_params.get("source_man", query_params.get("source_man_url", [None]))[0]
+    target_url = query_params.get("target_url", query_params.get("target", [None]))[0]
     
     if not source_url or not target_url:
         return 400, {}, b"source_url and target_url are required"
@@ -386,7 +444,84 @@ def process_swap_request(path: str, query_params: dict[str, list[str]], request_
             source_man_img, _ = _load_image(source_man_url, SOURCES_CACHE_DIR, "source_man_load", stage_times_ms)
 
         if _is_video(target_url):
-            return 501, {}, b"Video processing disabled for stability"
+            target_video_path = _load_video(target_url, VIDEOS_CACHE_DIR)
+            source_hash = _image_sha256_hex(source_img)
+            source_man_hash = _image_sha256_hex(source_man_img) if source_man_img else "none"
+            video_name_hash = _sha256_hex(str(target_video_path))
+            
+            cache_key = _sha256_hex(f"src={source_hash}|man={source_man_hash}|v={video_name_hash}|opts={repr(sorted(swap_options.items()))}")
+            result_video_path = VIDEOS_RESULTS_DIR / f"{cache_key}.mp4"
+            
+            with RESULT_LOCK:
+                if result_video_path.exists():
+                    _log_timing(request_id, path, time.perf_counter() - t_total_start, "video_cache_hit", stage_times_ms)
+                    return 200, {"Content-Type": "video/mp4"}, result_video_path.read_bytes()
+
+            def _run_video_swap_logic():
+                cap = cv2.VideoCapture(str(target_video_path))
+                width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+                total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                
+                tmp_output = result_video_path.with_suffix(".tmp.mp4")
+                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                out = cv2.VideoWriter(str(tmp_output), fourcc, fps, (width, height))
+                
+                model = _pick_swap_model()
+                
+                try:
+                    for i in range(total_frames):
+                        ret, frame = cap.read()
+                        if not ret: break
+                        
+                        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                        pil_frame = Image.fromarray(frame_rgb)
+                        
+                        # Stage 1: Female / Unknown fallback
+                        stage1_opts = swap_options.copy()
+                        if source_man_img: stage1_opts["gender_target"] = 1
+                        
+                        with MODEL_LOCK:
+                            swapped, _, _ = swap_face(source_img=source_img, target_img=pil_frame, model=model, **stage1_opts)
+                        
+                        # Stage 2: Male
+                        if source_man_img:
+                            stage2_opts = swap_options.copy()
+                            stage2_opts["gender_target"] = 2
+                            with MODEL_LOCK:
+                                swapped, _, _ = swap_face(source_img=source_man_img, target_img=swapped, model=model, **stage2_opts)
+                        
+                        res_frame = cv2.cvtColor(np.array(swapped), cv2.COLOR_RGB2BGR)
+                        out.write(res_frame)
+                        
+                        if i % 10 == 0:
+                            from scripts.reactor_swapper import clear_face_memory
+                            clear_face_memory()
+                            gc.collect()
+                            if torch.cuda.is_available(): torch.cuda.empty_cache()
+
+                finally:
+                    cap.release()
+                    out.release()
+                
+                # Audio merge
+                try:
+                    subprocess.run([
+                        "ffmpeg", "-y", "-i", str(tmp_output), "-i", str(target_video_path),
+                        "-map", "0:v:0", "-map", "1:a:0?", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest",
+                        str(result_video_path)
+                    ], check=True, capture_output=True)
+                    if tmp_output.exists(): tmp_output.unlink()
+                except Exception as e:
+                    LOGGER.warning("FFmpeg failed or not found, returning video without audio: %s", e)
+                    if tmp_output.exists(): tmp_output.rename(result_video_path)
+                    
+                return result_video_path.read_bytes()
+
+            body = SWAP_EXECUTOR.submit(_run_video_swap_logic).result()
+            _log_timing(request_id, path, time.perf_counter() - t_total_start, "video_processed", stage_times_ms)
+            return 200, {"Content-Type": "video/mp4"}, body
 
         target_img, target_cache_file = _load_image(target_url, TARGETS_CACHE_DIR, "target_load", stage_times_ms)
         
@@ -438,10 +573,10 @@ def process_swap_request(path: str, query_params: dict[str, list[str]], request_
                         if not target_face_position_file.exists(): _write_face_position(target_face_position_file, crop_box)
                     del target_bgr, faces
 
-            # STAGE 1: Process primary source (Female targets only if source_man is present)
+            # STAGE 1: Process primary source (Female / Unknown fallback if source_man is present)
             stage1_opts = swap_options.copy()
             if source_man_img:
-                stage1_opts["gender_target"] = 1 # Female only
+                stage1_opts["gender_target"] = 1 # Female / Unknown
             
             with MODEL_LOCK:
                 t_s1 = time.perf_counter()
@@ -458,8 +593,9 @@ def process_swap_request(path: str, query_params: dict[str, list[str]], request_
                     # We pass the result of stage 1 as the target for stage 2
                     final_swapped, bboxes_man, _ = swap_face(source_img=source_man_img, target_img=swapped, model=_pick_swap_model(), **stage2_opts)
                     mark("swap_stage2", t_s2)
-                    # If we started without a crop but now have one from either stage, update bboxes for crop_box
-                    if not only_face_square: bboxes = bboxes or bboxes_man
+                    # Correctly combine bboxes from both stages
+                    if bboxes_man:
+                        bboxes.extend(bboxes_man)
 
             out_img = final_swapped
             final_crop = None

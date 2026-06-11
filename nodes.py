@@ -162,6 +162,7 @@ class reactor:
             },
             "optional": {
                 "source_image": ("IMAGE",),
+                "source_man_image": ("IMAGE",),
                 "face_model": ("FACE_MODEL",),
                 "face_boost": ("FACE_BOOST",),
             },
@@ -535,6 +536,7 @@ class ReActorPlusOpt:
             },
             "optional": {
                 "source_image": ("IMAGE",),
+                "source_man_image": ("IMAGE",),
                 "face_model": ("FACE_MODEL",),
                 "options": ("OPTIONS",),
                 "face_boost": ("FACE_BOOST",),
@@ -563,7 +565,7 @@ class ReActorPlusOpt:
         self.boost_model_visibility = 1
         self.boost_cf_weight = 0.5
 
-    def execute(self, enabled, input_image, swap_model, facedetection, face_restore_model, face_restore_visibility, codeformer_weight, source_image=None, face_model=None, options=None, face_boost=None):
+    def execute(self, enabled, input_image, swap_model, facedetection, face_restore_model, face_restore_visibility, codeformer_weight, source_image=None, source_man_image=None, face_model=None, options=None, face_boost=None):
 
         if options is not None:
             self.faces_order = [options["input_faces_order"], options["source_faces_order"]]
@@ -581,7 +583,7 @@ class ReActorPlusOpt:
             self.face_boost_enabled = False
 
         result = reactor.execute(
-            self,enabled,input_image,swap_model,self.detect_gender_source,self.detect_gender_input,self.source_faces_index,self.input_faces_index,self.console_log_level,face_restore_model,face_restore_visibility,codeformer_weight,facedetection,source_image,face_model,self.faces_order, face_boost=face_boost
+            self,enabled,input_image,swap_model,self.detect_gender_source,self.detect_gender_input,self.source_faces_index,self.input_faces_index,self.console_log_level,face_restore_model,face_restore_visibility,codeformer_weight,facedetection,source_image,source_man_image,face_model,self.faces_order, face_boost=face_boost
         )
 
         return result

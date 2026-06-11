@@ -60,11 +60,13 @@ class FaceSwapScript(scripts.Script):
         face_restore_visibility,
         codeformer_weight,
         interpolation,
+        source_man_img=None,
     ):
         self.enable = enable
         if self.enable:
 
             self.source = img    
+            self.source_man = source_man_img
             self.swap_in_generated = swap_in_generated
             self.gender_source = gender_source
             self.gender_target = gender_target
@@ -107,6 +109,8 @@ class FaceSwapScript(scripts.Script):
 
                 if len(p.init_images) == 1:
 
+                    # Stage 1: Primary Source (Female / Unknown fallback if source_man present)
+                    s1_gender_target = 1 if self.source_man else self.gender_target
                     result, bbox, swapped_indexes = swap_face(
                         self.source,
                         p.init_images[0],
@@ -114,7 +118,7 @@ class FaceSwapScript(scripts.Script):
                         faces_index=self.faces_index,
                         model=self.model,
                         gender_source=self.gender_source,
-                        gender_target=self.gender_target,
+                        gender_target=s1_gender_target,
                         face_model=self.face_model,
                         faces_order=self.faces_order,
                         face_boost_enabled=self.face_boost_enabled,
@@ -123,6 +127,29 @@ class FaceSwapScript(scripts.Script):
                         codeformer_weight=self.codeformer_weight,
                         interpolation=self.interpolation,
                     )
+                    
+                    # Stage 2: source_man (Male only)
+                    if self.source_man:
+                        result, bboxes_man, swapped_indexes_man = swap_face(
+                            self.source_man,
+                            result,
+                            source_faces_index=self.source_faces_index,
+                            faces_index=self.faces_index,
+                            model=self.model,
+                            gender_source=self.gender_source,
+                            gender_target=2, # Male
+                            face_model=None, # source_man is always an image here
+                            faces_order=self.faces_order,
+                            face_boost_enabled=self.face_boost_enabled,
+                            face_restore_model=self.face_restore_model,
+                            face_restore_visibility=self.face_restore_visibility,
+                            codeformer_weight=self.codeformer_weight,
+                            interpolation=self.interpolation,
+                        )
+                        if bboxes_man:
+                            bbox.extend(bboxes_man)
+                            swapped_indexes.extend(swapped_indexes_man)
+
                     p.init_images[0] = result
                     p.bbox = bbox
                     p.swapped_indexes = swapped_indexes
@@ -143,6 +170,7 @@ class FaceSwapScript(scripts.Script):
                         face_restore_visibility=self.face_restore_visibility,
                         codeformer_weight=self.codeformer_weight,
                         interpolation=self.interpolation,
+                        source_man_img=self.source_man,
                     )
                     p.init_images = result
                     p.bbox = bbox
