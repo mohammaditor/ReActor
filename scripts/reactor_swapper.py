@@ -147,39 +147,43 @@ def get_face_gender(
     operated: str,
     order: str,
 ):
-    # 1. Сортируем ВСЕ найденные лица (без фильтрации!)
+    # 1. Sort all found faces
     faces_sorted = sort_by_order(face, order)
 
-    # 2. Проверяем, существует ли вообще лицо с таким визуальным индексом
     if face_index >= len(faces_sorted):
-        logger.info("Requested face index (%s) is out of bounds (max available index is %s)", face_index, len(faces_sorted) - 1)
+        logger.info("Requested face index (%s) is out of bounds (max %s)", face_index, len(faces_sorted) - 1)
         return None, 0, None
 
-    # 3. Берем конкретное лицо по его позиции на фото (например, второе справа)
     face_selected = faces_sorted[face_index]
 
-    # Если фильтр по полу отключен (no) - сразу отдаем лицо в работу
+    # If no gender filter is requested (0)
     if gender_condition == 0:
         return face_selected, 0, face_index
 
-    # 4. Проверяем пол выбранного лица
+    # 4. Check gender
     # face.gender: 0 = female, 1 = male
     # gender_condition: 1 = female, 2 = male
-    expected_gender = 0 if gender_condition == 1 else 1
     actual_gender = getattr(face_selected, 'gender', -1)
     
     sel_gender_str = "Male" if actual_gender == 1 else "Female" if actual_gender == 0 else "Unknown"
-    logger.info("%s Face %s: Detected Gender -%s-", operated, face_index, sel_gender_str)
-
-    # Если пол не совпадает с тем, что заказал юзер
-    # Fallback: Allow Unknown (-1) for Female condition (1)
-    is_match = (actual_gender == expected_gender) or (gender_condition == 1 and actual_gender == -1)
     
+    # Logic for source_man (Stage 1 and Stage 2)
+    # Stage 1 (gender_condition=1): Wants Female or Unknown fallback
+    # Stage 2 (gender_condition=2): Wants Male only
+    
+    is_match = False
+    if gender_condition == 1: # Stage 1: Primary Source
+        if actual_gender == 0 or actual_gender == -1: # Female or Unknown
+            is_match = True
+    elif gender_condition == 2: # Stage 2: source_man
+        if actual_gender == 1: # Male only
+            is_match = True
+            
     if not is_match:
-        logger.info(f"{operated} Face {face_index}: WRONG gender ({sel_gender_str})")
-        return face_selected, 1, face_index  # 1 означает флаг wrong_gender = True (цикл его пропустит)
+        logger.info(f"{operated} Face {face_index}: Skipping (Gender is {sel_gender_str}, expected match for condition {gender_condition})")
+        return face_selected, 1, face_index
 
-    # Если всё идеально
+    logger.info(f"{operated} Face {face_index}: Matching! (Gender: {sel_gender_str})")
     return face_selected, 0, face_index
 
 def half_det_size(det_size):
