@@ -136,7 +136,7 @@ class FaceSwapScript(scripts.Script):
                             source_faces_index=self.source_faces_index,
                             faces_index=self.faces_index,
                             model=self.model,
-                            gender_source=self.gender_source,
+                            gender_source=0, # Reset source filter for man image
                             gender_target=2, # Male
                             face_model=None, # source_man is always an image here
                             faces_order=self.faces_order,

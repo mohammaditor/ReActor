@@ -594,6 +594,7 @@ def process_swap_request(path: str, query_params: dict[str, list[str]], request_
             if source_man_img:
                 stage2_opts = swap_options.copy()
                 stage2_opts["gender_target"] = 2 # Male only
+                stage2_opts["gender_source"] = 0 # Reset source filter for man image
                 with MODEL_LOCK:
                     t_s2 = time.perf_counter()
                     # We pass the result of stage 1 as the target for stage 2

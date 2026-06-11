@@ -149,9 +149,16 @@ def get_face_gender(
 ):
     # 1. Sort all found faces
     faces_sorted = sort_by_order(face, order)
+    
+    # 2. Filter by gender BEFORE picking the index
+    # This ensures "Index 0" refers to the first face of that gender
+    if gender_condition == 1: # Female / Unknown fallback
+        faces_sorted = [f for f in faces_sorted if getattr(f, 'gender', -1) in [0, -1]]
+    elif gender_condition == 2: # Male
+        faces_sorted = [f for f in faces_sorted if getattr(f, 'gender', -1) == 1]
 
     if face_index >= len(faces_sorted):
-        logger.info("Requested face index (%s) is out of bounds (max %s)", face_index, len(faces_sorted) - 1)
+        logger.info("%s: No face found for requested gender (condition %s) at index %s", operated, gender_condition, face_index)
         return None, 0, None
 
     face_selected = faces_sorted[face_index]
@@ -160,29 +167,10 @@ def get_face_gender(
     if gender_condition == 0:
         return face_selected, 0, face_index
 
-    # 4. Check gender
-    # face.gender: 0 = female, 1 = male
-    # gender_condition: 1 = female, 2 = male
+    # 4. Check gender (already filtered, but we log for clarity)
     actual_gender = getattr(face_selected, 'gender', -1)
-    
     sel_gender_str = "Male" if actual_gender == 1 else "Female" if actual_gender == 0 else "Unknown"
     
-    # Logic for source_man (Stage 1 and Stage 2)
-    # Stage 1 (gender_condition=1): Wants Female or Unknown fallback
-    # Stage 2 (gender_condition=2): Wants Male only
-    
-    is_match = False
-    if gender_condition == 1: # Stage 1: Primary Source
-        if actual_gender == 0 or actual_gender == -1: # Female or Unknown
-            is_match = True
-    elif gender_condition == 2: # Stage 2: source_man
-        if actual_gender == 1: # Male only
-            is_match = True
-            
-    if not is_match:
-        logger.info(f"{operated} Face {face_index}: Skipping (Gender is {sel_gender_str}, expected match for condition {gender_condition})")
-        return face_selected, 1, face_index
-
     logger.info(f"{operated} Face {face_index}: Matching! (Gender: {sel_gender_str})")
     return face_selected, 0, face_index
 
@@ -421,7 +409,7 @@ def swap_face_many(
                 model=model,
                 source_faces_index=source_faces_index,
                 faces_index=faces_index,
-                gender_source=gender_source,
+                gender_source=0, # Reset source filter for man image
                 gender_target=2, # Male
                 face_model=None, # source_man is always an image here
                 faces_order=faces_order,
