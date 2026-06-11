@@ -407,6 +407,8 @@ def process_swap_request(path: str, query_params: dict[str, list[str]], request_
     if path not in {"/swap", "/swap_face_square", "/build_source_cache"}:
         return 404, {}, b"Use /swap, /swap_face_square or /build_source_cache"
 
+    only_face_square = path == "/swap_face_square"
+
     if path == "/build_source_cache":
         source_url = query_params.get("source_url", [None])[0]
         if not source_url: return 400, {}, b"source_url is required"
