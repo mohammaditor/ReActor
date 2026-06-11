@@ -366,8 +366,12 @@ def process_swap_request(path: str, query_params: dict[str, list[str]], request_
         except Exception as e: return 500, {}, str(e).encode("utf-8")
 
     only_face_square = path == "/swap_face_square"
-    source_url, target_url = query_params.get("source_url", [None])[0], query_params.get("target_url", [None])[0]
-    if not source_url or not target_url: return 400, {}, b"source_url and target_url are required"
+    source_url = query_params.get("source_url", [None])[0]
+    source_man_url = query_params.get("source_man", [None])[0]
+    target_url = query_params.get("target_url", [None])[0]
+    
+    if not source_url or not target_url:
+        return 400, {}, b"source_url and target_url are required"
 
     req_format = query_params.get("format", [output_format])[0].upper()
     if req_format not in {"JPEG", "PNG"}: req_format = "JPEG"
@@ -377,17 +381,25 @@ def process_swap_request(path: str, query_params: dict[str, list[str]], request_
         swap_options = _build_swap_options(query_params)
         source_img, _ = _load_image(source_url, SOURCES_CACHE_DIR, "source_load", stage_times_ms)
         
+        source_man_img = None
+        if source_man_url:
+            source_man_img, _ = _load_image(source_man_url, SOURCES_CACHE_DIR, "source_man_load", stage_times_ms)
+
         if _is_video(target_url):
             return 501, {}, b"Video processing disabled for stability"
 
         target_img, target_cache_file = _load_image(target_url, TARGETS_CACHE_DIR, "target_load", stage_times_ms)
-        source_hash, target_hash = _image_sha256_hex(source_img), _image_sha256_hex(target_img)
+        
+        source_hash = _image_sha256_hex(source_img)
+        source_man_hash = _image_sha256_hex(source_man_img) if source_man_img else "none"
+        target_hash = _image_sha256_hex(target_img)
+        
         target_face_cache_file = _face_cache_path_for_target(target_cache_file)
         target_face_position_file = _face_position_cache_path_for_target(target_cache_file)
         
+        cache_key = _sha256_hex(f"src={source_hash}|man={source_man_hash}|tgt={target_hash}|opts={repr(sorted(swap_options.items()))}|mode={'sq' if only_face_square else 'fl'}")
         source_result_dir = RESULTS_CACHE_DIR / source_hash
         source_result_dir.mkdir(parents=True, exist_ok=True)
-        cache_key = _sha256_hex(f"src={source_hash}|tgt={target_hash}|opts={repr(sorted(swap_options.items()))}|mode={'sq' if only_face_square else 'fl'}")
         result_path = source_result_dir / f"{cache_key}.jpg"
 
         with RESULT_LOCK:
@@ -403,10 +415,10 @@ def process_swap_request(path: str, query_params: dict[str, list[str]], request_
                 return 200, headers, body
 
         def _run_swap_logic():
-            run_swap_times = {}
             rt_target_img = target_img
             cached_pos = None
             
+            # STAGE 0: Optional Square Crop
             if only_face_square and target_face_cache_file.exists():
                 rt_target_img = Image.open(target_face_cache_file).convert("RGB")
                 cached_pos = _read_face_position(target_face_position_file)
@@ -426,21 +438,42 @@ def process_swap_request(path: str, query_params: dict[str, list[str]], request_
                         if not target_face_position_file.exists(): _write_face_position(target_face_position_file, crop_box)
                     del target_bgr, faces
 
+            # STAGE 1: Process primary source (Female targets only if source_man is present)
+            stage1_opts = swap_options.copy()
+            if source_man_img:
+                stage1_opts["gender_target"] = 1 # Female only
+            
             with MODEL_LOCK:
-                t_s = time.perf_counter()
-                swapped, bboxes, _ = swap_face(source_img=source_img, target_img=rt_target_img, model=_pick_swap_model(), **swap_options)
-                mark("swap", t_s)
+                t_s1 = time.perf_counter()
+                swapped, bboxes, _ = swap_face(source_img=source_img, target_img=rt_target_img, model=_pick_swap_model(), **stage1_opts)
+                mark("swap_stage1", t_s1)
 
-            out_img = swapped
+            # STAGE 2: Process source_man (Male targets only)
+            final_swapped = swapped
+            if source_man_img:
+                stage2_opts = swap_options.copy()
+                stage2_opts["gender_target"] = 2 # Male only
+                with MODEL_LOCK:
+                    t_s2 = time.perf_counter()
+                    # We pass the result of stage 1 as the target for stage 2
+                    final_swapped, bboxes_man, _ = swap_face(source_img=source_man_img, target_img=swapped, model=_pick_swap_model(), **stage2_opts)
+                    mark("swap_stage2", t_s2)
+                    # If we started without a crop but now have one from either stage, update bboxes for crop_box
+                    if not only_face_square: bboxes = bboxes or bboxes_man
+
+            out_img = final_swapped
             final_crop = None
             if only_face_square:
                 if cached_pos: final_crop = cached_pos
                 else:
-                    if not bboxes: raise RuntimeError("No swapped face")
-                    final_crop = _square_from_bbox(tuple(bboxes[0]), swapped.width, swapped.height)
-                    out_img = swapped.crop(final_crop)
+                    # Logic to determine final crop box from processed faces if not cached
+                    # Using bboxes from stage 1 or stage 2
+                    active_bboxes = bboxes if bboxes else (bboxes_man if source_man_img and 'bboxes_man' in locals() else None)
+                    if not active_bboxes: raise RuntimeError("No swapped face found for cropping")
+                    final_crop = _square_from_bbox(tuple(active_bboxes[0]), final_swapped.width, final_swapped.height)
+                    out_img = final_swapped.crop(final_crop)
                     with RESULT_LOCK:
-                        if not target_face_cache_file.exists(): target_img.crop(final_crop).save(target_face_cache_file, format="PNG")
+                        if not target_face_cache_file.exists(): rt_target_img.save(target_face_cache_file, format="PNG")
                         if not target_face_position_file.exists(): _write_face_position(target_face_position_file, final_crop)
 
             out_io = io.BytesIO()
@@ -449,9 +482,8 @@ def process_swap_request(path: str, query_params: dict[str, list[str]], request_
             if req_format == "JPEG":
                 with RESULT_LOCK: result_path.write_bytes(body)
             
-            # Cleanup locals
             if rt_target_img != target_img: del rt_target_img
-            del swapped, out_img, out_io
+            del swapped, final_swapped, out_img, out_io
             return body, final_crop
 
         body, crop_box = SWAP_EXECUTOR.submit(_run_swap_logic).result()
@@ -462,11 +494,8 @@ def process_swap_request(path: str, query_params: dict[str, list[str]], request_
             headers["Set-Cookie"] = f"swapped_face_pos={cv}; Path=/; SameSite=Lax"
         
         _log_timing(request_id, path, time.perf_counter() - t_total_start, "processed", stage_times_ms)
-        
-        # FINAL CLEANUP
         gc.collect()
         if torch.cuda.is_available(): torch.cuda.empty_cache()
-        
         return 200, headers, body
 
     except Exception as exc:
