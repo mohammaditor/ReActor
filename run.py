@@ -385,10 +385,14 @@ def _pick_swap_model() -> str:
 
 def _build_swap_options(params: dict[str, list[str]]) -> dict:
     def _bool(name, default): return params.get(name, [str(default)])[0].strip().lower() in {"1", "true", "yes", "on"}
-    def _int(name, default): return int(params.get(name, [str(default)])[0])
+    def _int(name, default): 
+        val = params.get(name, [""])[0].strip()
+        return int(val) if val.isnumeric() else default
     def _list(name, default, t):
         raw = params.get(name, [None])[0]
-        return [t(x.strip()) for x in raw.split(",") if x.strip()] if raw else default
+        if raw is None or raw.strip() == "": return default
+        return [t(x.strip()) for x in raw.split(",") if x.strip()]
+    
     return {
         "source_faces_index": _list("source_faces_index", [0], int),
         "faces_index": _list("faces_index", [0], int),
